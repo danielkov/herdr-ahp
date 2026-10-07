@@ -1,0 +1,398 @@
+//! Fake external CLI boundary; does not require or claim a real HerdR pane.
+#![cfg(unix)]
+use serde_json::{Value, json};
+use std::{
+    fs,
+    io::Write,
+    os::unix::fs::PermissionsExt,
+    path::PathBuf,
+    process::{Child, Command, Stdio},
+    time::{Duration, Instant},
+};
+struct Fixture {
+    root: PathBuf,
+    cli: PathBuf,
+    config: PathBuf,
+    log: PathBuf,
+}
+impl Fixture {
+    fn new(name: &str, release: bool, behavior: &str) -> Self {
+        let root = std::env::temp_dir().join(format!("herdr-ahp-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let cli = PathBuf::from("/bin/sh");
+        let script = root.join("pane");
+        let config = root.join("context.json");
+        let log = root.join("calls.jsonl");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' 'pane' \"$@\" '__END__' >> '{}'\n{behavior}\n",
+                log.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&config, serde_json::to_vec(&json!({"source":"org.example.bridge","agent":"example-agent",
+            "sequence_file":root.join("sequence"),"resume_argv":["example-agent","--resume","{session_id}"],
+            "release_on_eof":release})).unwrap()).unwrap();
+        Self {
+            root,
+            cli,
+            config,
+            log,
+        }
+    }
+    fn spawn(&self, enabled: bool) -> Child {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_herdr-ahp"));
+        c.current_dir(&self.root)
+            .args(["--config", self.config.to_str().unwrap()])
+            .env("HERDR_ENV", if enabled { "1" } else { "0" })
+            .env("HERDR_BIN_PATH", &self.cli)
+            .env("HERDR_PANE_ID", "pane-test")
+            .env("HERDR_SOCKET_PATH", self.root.join("unused.sock"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        c.spawn().unwrap()
+    }
+    fn calls(&self) -> Vec<Vec<String>> {
+        let data = fs::read_to_string(&self.log).unwrap_or_default();
+        data.split("__END__\n")
+            .take(data.matches("__END__\n").count())
+            .map(|s| s.lines().map(str::to_owned).collect())
+            .collect()
+    }
+    fn wait_calls(&self, count: usize) {
+        let start = Instant::now();
+        while self.calls().len() < count {
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "calls: {:?}",
+                self.calls()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+fn event(kind: &str, session: &str) -> Value {
+    let mut e = json!({"id":format!("evt-{kind}"),"type":kind,"time":"2026-10-07T12:00:00Z","source":"urn:example:host",
+        "session":{"id":session},"turn":{"id":"t1"}});
+    match kind {
+        "turn.start" => {
+            e["items"] = json!([]);
+            e["trigger"] = json!("user");
+        }
+        "turn.end" => {
+            e["items"] = json!([]);
+            e["outcome"] = json!("completed");
+            e["continuationCount"] = json!(0);
+        }
+        "tool.permission.request" => {
+            e["call"] = json!({"id":"c1"});
+            e["tool"] = json!({"name":"Shell","origin":"native","input":{},"kind":"shell"});
+            e["path"] = json!("shell");
+            e["sandboxBypass"] = json!(false);
+            e["suggestions"] = json!([]);
+        }
+        "session.end" => {
+            e["outcome"] = json!("completed");
+            e["reason"] = json!("session-switch");
+        }
+        _ => {}
+    }
+    e
+}
+fn send(child: &mut Child, e: Value) {
+    let frame = json!({"jsonrpc":"2.0","method":"hooks/observe","params":{"protocolVersion":"draft","event":e}});
+    writeln!(child.stdin.as_mut().unwrap(), "{frame}").unwrap();
+    child.stdin.as_mut().unwrap().flush().unwrap();
+}
+fn close(mut child: Child) -> std::process::Output {
+    drop(child.stdin.take());
+    child.wait_with_output().unwrap()
+}
+fn seq(args: &[String]) -> u64 {
+    let i = args.iter().position(|s| s == "--seq").unwrap();
+    args[i + 1].parse().unwrap()
+}
+#[test]
+fn maps_states_resume_and_actual_exit_opt_in() {
+    let f = Fixture::new("mapping", true, "");
+    let mut child = f.spawn(true);
+    for (i, (kind, state)) in [
+        ("turn.start", "working"),
+        ("tool.permission.request", "blocked"),
+        ("turn.end", "idle"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        send(&mut child, event(kind, "s1"));
+        f.wait_calls(i + 1);
+        let calls = f.calls();
+        let args = &calls[i];
+        assert_eq!(&args[..3], ["pane", "report-agent", "pane-test"]);
+        let p = args.iter().position(|s| s == "--state").unwrap();
+        assert_eq!(args[p + 1], *state);
+        assert_eq!(
+            &args[args.len() - 4..],
+            ["--", "example-agent", "--resume", "s1"]
+        );
+    }
+    send(&mut child, event("session.end", "s1"));
+    send(&mut child, event("turn.start", "s2"));
+    f.wait_calls(4);
+    let output = close(child);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "notifications must not emit stdout"
+    );
+    let calls = f.calls();
+    assert_eq!(calls.len(), 5);
+    assert_eq!(calls[4][1], "release-agent");
+    assert!(calls.windows(2).all(|w| seq(&w[1]) > seq(&w[0])));
+    let mut child = f.spawn(true);
+    send(&mut child, event("turn.start", "s3"));
+    f.wait_calls(6);
+    close(child);
+    assert!(seq(&f.calls()[5]) > seq(&calls[4]));
+}
+#[test]
+fn no_release_on_transport_eof_and_noop_outside_herdr() {
+    let f = Fixture::new("no-release", false, "");
+    let mut child = f.spawn(true);
+    send(&mut child, event("turn.start", "s1"));
+    f.wait_calls(1);
+    assert!(close(child).status.success());
+    assert_eq!(f.calls().len(), 1);
+    let mut child = f.spawn(false);
+    send(&mut child, event("turn.start", "s1"));
+    assert!(close(child).status.success());
+    assert_eq!(f.calls().len(), 1);
+}
+#[test]
+fn latest_state_and_timeout_are_bounded() {
+    let f = Fixture::new("coalesce", false, "sleep 2");
+    let mut child = f.spawn(true);
+    send(&mut child, event("turn.start", "s1"));
+    f.wait_calls(1);
+    for _ in 0..20 {
+        send(&mut child, event("tool.permission.request", "s1"));
+    }
+    send(&mut child, event("turn.end", "s1"));
+    let start = Instant::now();
+    assert!(close(child).status.success());
+    assert!(start.elapsed() < Duration::from_secs(2));
+    let calls = f.calls();
+    assert_eq!(calls.len(), 2);
+    let last = &calls[1];
+    assert_eq!(
+        last[last.iter().position(|s| s == "--state").unwrap() + 1],
+        "idle"
+    );
+}
+#[test]
+fn invalid_framing_does_not_release_and_uncertain_report_does() {
+    let f = Fixture::new("failure", true, "exit 9");
+    let mut child = f.spawn(true);
+    send(&mut child, event("turn.start", "s1"));
+    f.wait_calls(1);
+    close(child);
+    assert_eq!(f.calls().len(), 2);
+    assert_eq!(f.calls()[1][1], "release-agent");
+    let mut child = f.spawn(true);
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"{\"jsonrpc\":\"2.0\"}")
+        .unwrap();
+    let out = close(child);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert_eq!(f.calls().len(), 2);
+}
+#[test]
+fn sdk_registered_process_observe_smoke() {
+    use agenthooksprotocol::{
+        generated::{self as g, ergonomic_inputs::*},
+        hooks::{Hooks, HooksOptions},
+        registration::Registration,
+    };
+    let f = Fixture::new("sdk", false, "");
+    // Environment is passed canonically by registration; no global env mutations.
+    let registration: Registration = serde_json::from_value(json!({"protocolVersion":"draft","hooks":[{
+        "id":"org.example.bridge","transport":{"type":"stdio","command":"/bin/sh",
+        "args":["-c","export HERDR_ENV=1 HERDR_BIN_PATH=/bin/sh HERDR_PANE_ID=pane-test HERDR_SOCKET_PATH=unused; exec \"$1\" --config \"$2\"", "smoke", env!("CARGO_BIN_EXE_herdr-ahp"), f.config],
+        "cwd":f.root,"lifecycle":"persistent"},
+        "subscriptions":[{"events":["turn.start"],"mode":"observe","content":{"default":"metadata"}}]}]})).unwrap();
+    let options = HooksOptions::from_declarations(
+        "urn:example:host",
+        [(g::EventType::TurnStart, g::capability::observe())],
+    )
+    .unwrap();
+    let hooks = Hooks::new(registration, options).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        hooks
+            .turn_start(
+                TurnStartInput::new(
+                    vec![],
+                    g::TurnStartInputTrigger::User,
+                    g::TurnStartInputTurn::new("t1"),
+                )
+                .with_session(Box::new(g::Session::new("s1"))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hooks.wait_until_idle().await.delivered, 1);
+        // SDK observe success means flushed stdin, not callback completion.
+        f.wait_calls(1);
+        hooks.shutdown().await.unwrap();
+    });
+    assert_eq!(f.calls()[0][1], "report-agent");
+}
+
+#[test]
+fn corrupt_or_locked_sequence_disables_only_reporting() {
+    let f = Fixture::new("storage", false, "");
+    fs::write(f.root.join("sequence"), "corrupt").unwrap();
+    let mut child = f.spawn(true);
+    send(&mut child, event("turn.start", "s1"));
+    let out = close(child);
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("reporting disabled"));
+    assert!(f.calls().is_empty());
+    fs::write(f.root.join("sequence"), "1\n").unwrap();
+    let owner = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(f.root.join("sequence"))
+        .unwrap();
+    owner.lock().unwrap();
+    let mut child = f.spawn(true);
+    send(&mut child, event("turn.start", "s1"));
+    let out = close(child);
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(f.calls().is_empty());
+}
+#[test]
+fn uncertain_update_cannot_deduplicate_an_old_success() {
+    let f = Fixture::new(
+        "uncertain",
+        false,
+        "case \" $* \" in *' --state working '*) sleep 2;; esac",
+    );
+    let mut child = f.spawn(true);
+    send(&mut child, event("turn.end", "s1"));
+    f.wait_calls(1);
+    // A complete CLI record precedes process exit; wait for the success to settle.
+    std::thread::sleep(Duration::from_millis(30));
+    send(&mut child, event("turn.start", "s1"));
+    f.wait_calls(2);
+    send(&mut child, event("turn.end", "s1"));
+    assert!(close(child).status.success());
+    let calls = f.calls();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(
+        calls[2][calls[2].iter().position(|s| s == "--state").unwrap() + 1],
+        "idle"
+    );
+}
+#[test]
+fn possible_first_acquisition_is_released_on_proven_exit() {
+    let f = Fixture::new(
+        "uncertain-release",
+        true,
+        "case \"$1\" in report-agent) sleep 2;; esac",
+    );
+    let mut child = f.spawn(true);
+    send(&mut child, event("turn.start", "s1"));
+    f.wait_calls(1);
+    assert!(close(child).status.success());
+    let calls = f.calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1][1], "release-agent");
+    assert!(seq(&calls[1]) > seq(&calls[0]));
+}
+
+#[test]
+fn explicit_host_exit_release_uses_shared_sequence_after_hook_stops() {
+    let f = Fixture::new("explicit-release", false, "");
+    let mut child = f.spawn(true);
+    send(&mut child, event("turn.start", "s1"));
+    f.wait_calls(1);
+    assert!(close(child).status.success());
+    let out = Command::new(env!("CARGO_BIN_EXE_herdr-ahp"))
+        .current_dir(&f.root)
+        .args(["--config", f.config.to_str().unwrap(), "--release"])
+        .env("HERDR_ENV", "1")
+        .env("HERDR_BIN_PATH", &f.cli)
+        .env("HERDR_PANE_ID", "pane-test")
+        .env("HERDR_SOCKET_PATH", "unused")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty());
+    let calls = f.calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1][1], "release-agent");
+    assert!(seq(&calls[1]) > seq(&calls[0]));
+}
+
+#[test]
+fn canonical_examples_are_admitted_with_exact_observe_grants() {
+    use agenthooksprotocol::{
+        generated as g,
+        hooks::{Hooks, HooksOptions},
+        registration::Registration,
+    };
+    let context: herdr_ahp::Config =
+        serde_json::from_str(include_str!("../examples/adapter-context.json")).unwrap();
+    context.validate().unwrap();
+    let registration: Registration =
+        serde_json::from_str(include_str!("../examples/registration.json")).unwrap();
+    let options = HooksOptions::from_declarations(
+        "urn:example:agent",
+        [
+            (g::EventType::SessionStart, g::capability::observe()),
+            (g::EventType::TurnStart, g::capability::observe()),
+            (g::EventType::TurnEnd, g::capability::observe()),
+            (
+                g::EventType::ToolPermissionRequest,
+                g::capability::observe(),
+            ),
+            (
+                g::EventType::ToolPermissionResolved,
+                g::capability::observe(),
+            ),
+            (
+                g::EventType::UserElicitationRequest,
+                g::capability::observe(),
+            ),
+            (
+                g::EventType::UserElicitationResult,
+                g::capability::observe(),
+            ),
+        ],
+    )
+    .unwrap();
+    // Constructor validates canonical registration/grants without launching I/O.
+    Hooks::new(registration, options).unwrap();
+}
