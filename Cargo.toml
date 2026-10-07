@@ -7,8 +7,8 @@ description = "Generic Agent Hooks Protocol observation bridge for HerdR"
 
 [dependencies]
 agenthooksprotocol = { version = "=0.1.0", default-features = false }
-serde = { version = "=1.0.228", default-features = false, features = ["derive", "std"] }
-serde_json = { version = "=1.0.145", default-features = false, features = ["std"] }
+serde = { version = "=1.0.229", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "=1.0.151", default-features = false, features = ["std"] }
 
 [profile.dev]
 debug = 0
@@ -16,4 +16,4 @@ incremental = false
 
 [dev-dependencies]
 agenthooksprotocol = { version = "=0.1.0", default-features = false, features = ["tokio-process"] }
-tokio = { version = "=1.48.0", default-features = false, features = ["rt", "time"] }
+tokio = { version = "=1.53.1", default-features = false, features = ["rt", "time"] }

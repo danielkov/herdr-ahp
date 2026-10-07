@@ -357,7 +357,7 @@ fn explicit_host_exit_release_uses_shared_sequence_after_hook_stops() {
 }
 
 #[test]
-fn canonical_examples_are_admitted_with_exact_observe_grants() {
+fn optional_interaction_example_is_admitted_with_exact_observe_grants() {
     use agenthooksprotocol::{
         generated as g,
         hooks::{Hooks, HooksOptions},
@@ -366,8 +366,10 @@ fn canonical_examples_are_admitted_with_exact_observe_grants() {
     let context: herdr_ahp::Config =
         serde_json::from_str(include_str!("../examples/adapter-context.json")).unwrap();
     context.validate().unwrap();
-    let registration: Registration =
-        serde_json::from_str(include_str!("../examples/registration.json")).unwrap();
+    let registration: Registration = serde_json::from_str(include_str!(
+        "../examples/registration-with-interactions.json"
+    ))
+    .unwrap();
     let options = HooksOptions::from_declarations(
         "urn:example:agent",
         [
@@ -394,5 +396,26 @@ fn canonical_examples_are_admitted_with_exact_observe_grants() {
     )
     .unwrap();
     // Constructor validates canonical registration/grants without launching I/O.
+    Hooks::new(registration, options).unwrap();
+}
+
+#[test]
+fn minimal_registration_requires_only_session_turn_grants() {
+    use agenthooksprotocol::{
+        generated as g,
+        hooks::{Hooks, HooksOptions},
+        registration::Registration,
+    };
+    let registration: Registration =
+        serde_json::from_str(include_str!("../examples/registration.json")).unwrap();
+    let options = HooksOptions::from_declarations(
+        "urn:example:agent",
+        [
+            (g::EventType::SessionStart, g::capability::observe()),
+            (g::EventType::TurnStart, g::capability::observe()),
+            (g::EventType::TurnEnd, g::capability::observe()),
+        ],
+    )
+    .unwrap();
     Hooks::new(registration, options).unwrap();
 }

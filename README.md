@@ -19,8 +19,13 @@ cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
 ```
 
-Copy `examples/adapter-context.json` and `examples/registration.json`, replacing
-all example paths, identities, and resume options. `source` identifies **your
+Copy `examples/adapter-context.json` and the **minimal**
+`examples/registration.json`, replacing all example paths, identities, and resume
+options. The minimal registration subscribes only to `session.start`, `turn.start`,
+and `turn.end`, so it works with hosts that implement session/turn boundaries but
+not approval or elicitation workflows. `examples/registration-with-interactions.json`
+is a separate optional full registration for hosts that actually implement those
+interaction boundaries. `source` identifies **your
 integration**, remains stable across restarts, and must not use HerdR's reserved
 `herdr:` prefix. `agent` is the actual agent's user-visible name, not the bridge
 name or another vendor's name. AHP event `source` is separate; optional
@@ -60,13 +65,14 @@ let options = HooksOptions::from_declarations("urn:example:agent", [
     (g::EventType::SessionStart, g::capability::observe()),
     (g::EventType::TurnStart, g::capability::observe()),
     (g::EventType::TurnEnd, g::capability::observe()),
-    (g::EventType::ToolPermissionRequest, g::capability::observe()),
-    (g::EventType::ToolPermissionResolved, g::capability::observe()),
-    (g::EventType::UserElicitationRequest, g::capability::observe()),
-    (g::EventType::UserElicitationResult, g::capability::observe()),
 ])?;
 let hooks = Hooks::new(registration, options)?;
 ```
+
+When opting into the interaction registration, additionally grant exactly
+`ToolPermissionRequest`, `ToolPermissionResolved`, `UserElicitationRequest`, and
+`UserElicitationResult` with `g::capability::observe()`. Do not infer host support
+or authority merely from a registration file.
 
 The host needs SDK feature `tokio-process` and its own Tokio runtime to deliver
 registered process calls. Use its typed event boundaries and await observation
@@ -170,9 +176,47 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"hooks/observe","params":{"protocolVers
 Expected stdout: empty, exit status 0. In a **real HerdR pane**, register the hook
 with your agent, then check `herdr agent list` while starting a turn, blocking on a
 permission, finishing, switching sessions, and quitting. Test restore by restarting
-the HerdR server and verify the configured command resumes the session. No live
-pane/restore testing has been performed here.
+the HerdR server and verify the configured command resumes the session. No server-restart
+restore testing has been performed here. Isolated live state/release validation
+has since passed on HerdR 0.9.3; see `LIVE_VALIDATION.md`.
 
-See `DEPENDENCY_AUDIT.md` for checksum/advisory checks and the explicitly
-**incomplete dependency provenance review**. This implementation is locally
-validated, not a dependency-security approval or live HerdR certification.
+See `DEPENDENCY_AUDIT.md` for the accepted reduced dependency selection:
+previously vetted exact releases and approved SDK-family provenance are reused,
+not misrepresented as a fresh independent audit of every transitive package.
+
+### Reusable SDK demonstration host
+
+`examples/sdk_driver.rs` reads canonical event objects as newline-delimited JSON,
+uses the SDK's validated client and registered process transport, and emits JSON
+acknowledgements. Those acknowledgements mean delivery to hook stdin, not that
+HerdR has applied the report. `{"shutdown":true}` is a demonstration-host control
+line (not an AHP event); it shuts down the hook transport without claiming the
+actual host quit or automatically releasing a pane.
+
+```sh
+cargo build --locked --example sdk_driver
+# Use a registration with configured absolute binary/context paths. Force a
+# no-HerdR smoke outside an explicitly isolated live test pane:
+HERDR_ENV=0 target/debug/examples/sdk_driver /absolute/path/to/registration.json
+```
+
+For live experiments, create a uniquely named headless HerdR session and a pane
+in **that session**. Run the driver as a foreground command there, check each
+state via named-session `pane get`, then release on actual driver exit and stop/
+delete only the resources created for the test. Never substitute the inherited
+production pane/socket or stop the unnamed/default session.
+
+The opt-in Unix live helper automates this isolation and cleanup:
+
+```sh
+cargo build --release --locked
+cargo build --example sdk_driver --locked
+python3 scripts/live_smoke.py                 # Minimal session/turn subset
+python3 scripts/live_smoke.py --interactions  # Optional permission events
+```
+
+It refuses existing sessions, strips inherited HerdR caller context from control
+commands, verifies a different named socket, creates a test pane, runs the actual
+SDK driver there, and stops/deletes only its uniquely named session. Evidence is
+retained in a private temporary directory. It does not restart or restore the
+server, and does not inspect/change production-pane agent or resume data.

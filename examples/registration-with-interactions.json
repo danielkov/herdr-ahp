@@ -1,0 +1,17 @@
+{
+  "protocolVersion": "draft",
+  "hooks": [{
+    "id": "org.example.agent.herdr-ahp",
+    "transport": {
+      "type": "stdio",
+      "command": "/absolute/path/to/herdr-ahp",
+      "args": ["--config", "/absolute/path/to/adapter-context.json"],
+      "lifecycle": "persistent"
+    },
+    "subscriptions": [{
+      "events": ["session.start", "turn.start", "turn.end", "tool.permission.request", "tool.permission.resolved", "user.elicitation.request", "user.elicitation.result"],
+      "mode": "observe",
+      "content": {"default": "metadata"}
+    }]
+  }]
+}
