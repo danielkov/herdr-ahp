@@ -1,59 +1,64 @@
-use serde::Deserialize;
 use serde_json::Value;
 use std::{
     ffi::{OsStr, OsString},
-    fs::{File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::mpsc,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone)]
 pub struct Config {
     /// Stable integration source, distinct from the AHP event source.
     pub source: String,
-    /// User-visible name of the actual host agent.
-    pub agent: String,
-    /// Durable, private path. Use a different file for each source/pane pair.
-    pub sequence_file: PathBuf,
-    #[serde(default)]
+    /// User-visible agent name. Falls back to the event's `session.agent.id`.
+    pub agent: Option<String>,
+    /// Command that reopens a session; `{session_id}` is substituted.
     pub resume_argv: Vec<String>,
-    /// Optional trusted AHP source filter (not authentication).
-    #[serde(default)]
+    /// Ignore events whose AHP `source` differs.
     pub event_source: Option<String>,
-    /// Restrict to one session if a host also emits subagent events.
-    #[serde(default)]
+    /// Ignore events from other sessions.
     pub session_id: Option<String>,
     /// Release on clean stdin EOF. Enable only if EOF means the agent quit.
-    #[serde(default)]
     pub release_on_eof: bool,
+}
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            source: "herdr-ahp".into(),
+            agent: None,
+            resume_argv: Vec::new(),
+            event_source: None,
+            session_id: None,
+            release_on_eof: false,
+        }
+    }
+}
+const DEFAULT_AGENT: &str = "agent";
+fn valid_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 128 && !name.chars().any(char::is_control)
 }
 impl Config {
     pub fn validate(&self) -> Result<(), String> {
-        if self.source.is_empty()
-            || self.source.starts_with("herdr:")
-            || self.source.len() > 128
-            || self.agent.is_empty()
-            || self.agent.len() > 128
-            || self
-                .source
-                .chars()
-                .chain(self.agent.chars())
-                .any(char::is_control)
-        {
-            return Err("invalid source/agent identity".into());
+        if !valid_name(&self.source) || self.source.starts_with("herdr:") {
+            return Err("invalid --source".into());
         }
-        if self.sequence_file.as_os_str().is_empty() {
-            return Err("sequence_file is required".into());
+        if self.agent.as_deref().is_some_and(|a| !valid_name(a)) {
+            return Err("invalid --agent".into());
         }
         if !self.resume_argv.is_empty() {
             validate_argv(&self.resume_argv)?;
         }
         Ok(())
+    }
+    fn agent_for(&self, event: &Value) -> String {
+        self.agent
+            .as_deref()
+            .or(event["session"]["agent"]["id"]
+                .as_str()
+                .filter(|a| valid_name(a)))
+            .unwrap_or(DEFAULT_AGENT)
+            .into()
     }
 }
 fn validate_argv(argv: &[String]) -> Result<(), String> {
@@ -76,6 +81,7 @@ fn validate_argv(argv: &[String]) -> Result<(), String> {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Report {
+    agent: String,
     state: &'static str,
     message: Option<&'static str>,
     session: String,
@@ -115,11 +121,24 @@ fn map_event(config: &Config, event: &Value) -> Option<Report> {
         Vec::new()
     };
     Some(Report {
+        agent: config.agent_for(event),
         state,
         message,
         session: session.into(),
         argv,
     })
+}
+/// Wall-clock microseconds, bumped past the previous value if the clock stalls.
+#[derive(Default)]
+struct Sequence(u64);
+impl Sequence {
+    fn next(&mut self) -> u64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros() as u64);
+        self.0 = now.max(self.0.saturating_add(1));
+        self.0
+    }
 }
 
 /// HerdR CLI target. Reporting requires all of `HERDR_ENV=1`, `HERDR_BIN_PATH`,
@@ -128,7 +147,6 @@ struct Herdr {
     bin: OsString,
     pane: OsString,
     source: String,
-    agent: String,
 }
 impl Herdr {
     fn from_env(config: &Config) -> Option<Self> {
@@ -141,10 +159,9 @@ impl Herdr {
             bin: var("HERDR_BIN_PATH")?,
             pane: var("HERDR_PANE_ID")?,
             source: config.source.clone(),
-            agent: config.agent.clone(),
         })
     }
-    fn run(&self, command: &str, seq: u64, extra: Vec<OsString>) -> Option<bool> {
+    fn run(&self, command: &str, agent: &str, seq: u64, extra: Vec<OsString>) -> Option<bool> {
         let mut args: Vec<OsString> = vec![
             "pane".into(),
             command.into(),
@@ -152,7 +169,7 @@ impl Herdr {
             "--source".into(),
             self.source.clone().into(),
             "--agent".into(),
-            self.agent.clone().into(),
+            agent.into(),
             "--seq".into(),
             seq.to_string().into(),
         ];
@@ -173,22 +190,17 @@ impl Herdr {
             ]);
             extra.extend(report.argv.iter().map(Into::into));
         }
-        self.run("report-agent", seq, extra)
+        self.run("report-agent", &report.agent, seq, extra)
     }
-    fn release(&self, seq: u64) -> Option<bool> {
-        self.run("release-agent", seq, Vec::new())
+    fn release(&self, agent: &str, seq: u64) -> Option<bool> {
+        self.run("release-agent", agent, seq, Vec::new())
     }
 }
 /// Release the pane. Run only after the agent quits and the hook has stopped.
 pub fn release(config: &Config) {
-    let Some(herdr) = Herdr::from_env(config) else {
-        return;
-    };
-    match Sequence::open(&config.sequence_file).and_then(|mut s| s.next()) {
-        Ok(seq) => {
-            herdr.release(seq);
-        }
-        Err(_) => eprintln!("herdr-ahp: release skipped (sequence storage unavailable or owned)"),
+    if let Some(herdr) = Herdr::from_env(config) {
+        let agent = config.agent.as_deref().unwrap_or(DEFAULT_AGENT);
+        herdr.release(agent, Sequence::default().next());
     }
 }
 enum Message {
@@ -201,8 +213,8 @@ pub struct Reporter {
     worker: Option<thread::JoinHandle<()>>,
 }
 impl Reporter {
-    /// Outside HerdR, or if sequence storage/worker startup fails, reporting is
-    /// disabled but the protocol server keeps running.
+    /// Outside HerdR, or if the worker cannot start, reporting is disabled but
+    /// the protocol server keeps running.
     pub fn start(config: Config) -> Self {
         let disabled = |config| Self {
             config,
@@ -212,15 +224,10 @@ impl Reporter {
         let Some(herdr) = Herdr::from_env(&config) else {
             return disabled(config);
         };
-        // The file lock stops a second hook for this pane from reporting.
-        let Ok(sequence) = Sequence::open(&config.sequence_file) else {
-            eprintln!("herdr-ahp: reporting disabled (sequence storage unavailable or owned)");
-            return disabled(config);
-        };
         let (tx, rx) = mpsc::channel();
         match thread::Builder::new()
             .name("herdr-reporter".into())
-            .spawn(move || run_worker(rx, herdr, sequence))
+            .spawn(move || run_worker(rx, herdr))
         {
             Ok(worker) => Self {
                 config,
@@ -257,53 +264,11 @@ impl Drop for Reporter {
         }
     }
 }
-struct Sequence {
-    file: File,
-    last: u64,
-}
-impl Sequence {
-    fn open(path: &Path) -> io::Result<Self> {
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(path)?;
-        file.try_lock().map_err(io::Error::other)?;
-        let mut contents = String::new();
-        (&mut file).take(64).read_to_string(&mut contents)?;
-        let last = if contents.is_empty() {
-            0
-        } else {
-            contents.trim().parse().map_err(io::Error::other)?
-        };
-        Ok(Self { file, last })
-    }
-    /// `max(previous + 1, unix_time_ms)`, persisted before the command is sent.
-    fn next(&mut self) -> io::Result<u64> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(io::Error::other)?
-            .as_millis();
-        let next = self
-            .last
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("sequence exhausted"))?
-            .max(u64::try_from(now).map_err(io::Error::other)?);
-        let line = format!("{next}\n");
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(line.as_bytes())?;
-        self.file.set_len(line.len() as u64)?;
-        self.file.sync_data()?;
-        self.last = next;
-        Ok(next)
-    }
-}
-fn run_worker(rx: mpsc::Receiver<Message>, herdr: Herdr, mut sequence: Sequence) {
+fn run_worker(rx: mpsc::Receiver<Message>, herdr: Herdr) {
+    let mut sequence = Sequence::default();
     let mut last_success: Option<Report> = None;
-    let mut owned = false;
+    // Agent of the last attempted report; release only after a possible acquisition.
+    let mut owner: Option<String> = None;
     while let Ok(first) = rx.recv() {
         // Coalesce whatever queued while the previous command ran: only the
         // newest state is worth sending.
@@ -320,22 +285,16 @@ fn run_worker(rx: mpsc::Receiver<Message>, herdr: Herdr, mut sequence: Sequence)
             // A timeout/nonzero exit may follow server acceptance. Never use a
             // prior acknowledgement to deduplicate after an uncertain update.
             last_success = None;
-            let Ok(seq) = sequence.next() else {
-                return;
-            };
-            if let Some(success) = herdr.report(seq, &report) {
-                owned = true; // Source-scoped release is safe after possible acquisition.
+            if let Some(success) = herdr.report(sequence.next(), &report) {
+                owner = Some(report.agent.clone());
                 if success {
                     last_success = Some(report);
                 }
             }
         }
         if let Some(release) = finish {
-            if release
-                && owned
-                && let Ok(seq) = sequence.next()
-            {
-                herdr.release(seq);
+            if release && let Some(agent) = &owner {
+                herdr.release(agent, sequence.next());
             }
             return;
         }
@@ -371,16 +330,13 @@ mod tests {
     fn config() -> Config {
         Config {
             source: "org.example.bridge".into(),
-            agent: "example-agent".into(),
-            sequence_file: PathBuf::from("unused"),
+            agent: Some("example-agent".into()),
             resume_argv: vec![
                 "example-agent".into(),
                 "--resume".into(),
                 "{session_id}".into(),
             ],
-            event_source: None,
-            session_id: None,
-            release_on_eof: false,
+            ..Config::default()
         }
     }
     #[test]
@@ -436,6 +392,16 @@ mod tests {
         );
     }
     #[test]
+    fn agent_name_falls_back_to_event_then_default() {
+        let event =
+            serde_json::json!({"type":"turn.start","session":{"id":"s1","agent":{"id":"codex"}}});
+        assert_eq!(map_event(&config(), &event).unwrap().agent, "example-agent");
+        let config = Config::default();
+        assert_eq!(map_event(&config, &event).unwrap().agent, "codex");
+        let bare = serde_json::json!({"type":"turn.start","session":{"id":"s1"}});
+        assert_eq!(map_event(&config, &bare).unwrap().agent, DEFAULT_AGENT);
+    }
+    #[test]
     fn resume_constraints_do_not_suppress_state() {
         let c = config();
         let report = map_event(
@@ -458,18 +424,11 @@ mod tests {
         assert!(c.validate().is_err());
     }
     #[test]
-    fn sequence_survives_restart_and_rejects_concurrent_owner() {
-        let path = std::env::temp_dir().join(format!("herdr-sequence-test-{}", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let mut sequence = Sequence::open(&path).unwrap();
-        let first = sequence.next().unwrap();
-        assert!(Sequence::open(&path).is_err());
-        drop(sequence);
-        let mut second = Sequence::open(&path).unwrap();
-        assert!(second.next().unwrap() > first);
-        drop(second);
-        std::fs::write(&path, "corrupt").unwrap();
-        assert!(Sequence::open(&path).is_err());
-        std::fs::remove_file(path).unwrap();
+    fn sequence_strictly_increases() {
+        let mut sequence = Sequence::default();
+        let first = sequence.next();
+        assert!(sequence.next() > first);
+        sequence.0 = u64::MAX - 1;
+        assert_eq!(sequence.next(), u64::MAX);
     }
 }

@@ -1,8 +1,0 @@
-{
-  "source": "org.example.agent.herdr-ahp",
-  "agent": "example-agent",
-  "sequence_file": "/home/you/.local/state/herdr-ahp/pane-123.seq",
-  "resume_argv": ["example-agent", "--resume", "{session_id}", "--model", "example-model"],
-  "event_source": "urn:example:agent",
-  "release_on_eof": false
-}

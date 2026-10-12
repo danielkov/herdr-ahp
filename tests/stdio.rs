@@ -12,7 +12,7 @@ use std::{
 struct Fixture {
     root: PathBuf,
     cli: PathBuf,
-    config: PathBuf,
+    args: Vec<String>,
     log: PathBuf,
 }
 impl Fixture {
@@ -22,7 +22,6 @@ impl Fixture {
         fs::create_dir(&root).unwrap();
         let cli = PathBuf::from("/bin/sh");
         let script = root.join("pane");
-        let config = root.join("context.json");
         let log = root.join("calls.jsonl");
         fs::write(
             &script,
@@ -33,20 +32,24 @@ impl Fixture {
         )
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::write(&config, serde_json::to_vec(&json!({"source":"org.example.bridge","agent":"example-agent",
-            "sequence_file":root.join("sequence"),"resume_argv":["example-agent","--resume","{session_id}"],
-            "release_on_eof":release})).unwrap()).unwrap();
+        let mut args: Vec<String> = ["--source", "org.example.bridge", "--agent", "example-agent"]
+            .map(String::from)
+            .into();
+        if release {
+            args.push("--release-on-eof".into());
+        }
+        args.extend(["--", "example-agent", "--resume", "{session_id}"].map(String::from));
         Self {
             root,
             cli,
-            config,
+            args,
             log,
         }
     }
     fn spawn(&self, enabled: bool) -> Child {
         let mut c = Command::new(env!("CARGO_BIN_EXE_herdr-ahp"));
         c.current_dir(&self.root)
-            .args(["--config", self.config.to_str().unwrap()])
+            .args(&self.args)
             .env("HERDR_ENV", if enabled { "1" } else { "0" })
             .env("HERDR_BIN_PATH", &self.cli)
             .env("HERDR_PANE_ID", "pane-test")
@@ -236,7 +239,7 @@ fn sdk_registered_process_observe_smoke() {
     // Registration has no env map, so set HerdR variables through sh.
     let registration: Registration = serde_json::from_value(json!({"protocolVersion":"draft","hooks":[{
         "id":"org.example.bridge","transport":{"type":"stdio","command":"/bin/sh",
-        "args":["-c","export HERDR_ENV=1 HERDR_BIN_PATH=/bin/sh HERDR_PANE_ID=pane-test HERDR_SOCKET_PATH=unused; exec \"$1\" --config \"$2\"", "smoke", env!("CARGO_BIN_EXE_herdr-ahp"), f.config],
+        "args":["-c","export HERDR_ENV=1 HERDR_BIN_PATH=/bin/sh HERDR_PANE_ID=pane-test HERDR_SOCKET_PATH=unused; exec \"$0\" --agent example-agent", env!("CARGO_BIN_EXE_herdr-ahp")],
         "cwd":f.root,"lifecycle":"persistent"},
         "subscriptions":[{"events":["turn.start"],"mode":"observe","content":{"default":"metadata"}}]}]})).unwrap();
     let options = HooksOptions::new(
@@ -271,31 +274,6 @@ fn sdk_registered_process_observe_smoke() {
     assert_eq!(f.calls()[0][1], "report-agent");
 }
 
-#[test]
-fn corrupt_or_locked_sequence_disables_only_reporting() {
-    let f = Fixture::new("storage", false, "");
-    fs::write(f.root.join("sequence"), "corrupt").unwrap();
-    let mut child = f.spawn(true);
-    send(&mut child, event("turn.start", "s1"));
-    let out = close(child);
-    assert!(out.status.success());
-    assert!(out.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("reporting disabled"));
-    assert!(f.calls().is_empty());
-    fs::write(f.root.join("sequence"), "1\n").unwrap();
-    let owner = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(f.root.join("sequence"))
-        .unwrap();
-    owner.lock().unwrap();
-    let mut child = f.spawn(true);
-    send(&mut child, event("turn.start", "s1"));
-    let out = close(child);
-    assert!(out.status.success());
-    assert!(out.stdout.is_empty());
-    assert!(f.calls().is_empty());
-}
 #[test]
 fn uncertain_update_cannot_deduplicate_an_old_success() {
     let f = Fixture::new(
@@ -337,7 +315,7 @@ fn possible_first_acquisition_is_released_on_proven_exit() {
 }
 
 #[test]
-fn explicit_host_exit_release_uses_shared_sequence_after_hook_stops() {
+fn explicit_release_after_hook_stops() {
     let f = Fixture::new("explicit-release", false, "");
     let mut child = f.spawn(true);
     send(&mut child, event("turn.start", "s1"));
@@ -345,7 +323,7 @@ fn explicit_host_exit_release_uses_shared_sequence_after_hook_stops() {
     assert!(close(child).status.success());
     let out = Command::new(env!("CARGO_BIN_EXE_herdr-ahp"))
         .current_dir(&f.root)
-        .args(["--config", f.config.to_str().unwrap(), "--release"])
+        .args(["--source", "org.example.bridge", "--release"])
         .env("HERDR_ENV", "1")
         .env("HERDR_BIN_PATH", &f.cli)
         .env("HERDR_PANE_ID", "pane-test")
@@ -376,9 +354,6 @@ fn optional_interaction_example_is_admitted_with_exact_observe_grants() {
         hooks::{Hooks, HooksOptions},
         registration::Registration,
     };
-    let context: herdr_ahp::Config =
-        serde_json::from_str(include_str!("../examples/adapter-context.json")).unwrap();
-    context.validate().unwrap();
     let registration: Registration = serde_json::from_str(include_str!(
         "../examples/registration-with-interactions.json"
     ))

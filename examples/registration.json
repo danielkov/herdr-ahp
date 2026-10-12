@@ -2,14 +2,10 @@
   "protocolVersion": "draft",
   "hooks": [
     {
-      "id": "org.example.agent.herdr-ahp",
+      "id": "com.github.danielkov.herdr-ahp",
       "transport": {
         "type": "stdio",
-        "command": "/absolute/path/to/herdr-ahp",
-        "args": [
-          "--config",
-          "/absolute/path/to/adapter-context.json"
-        ],
+        "command": "herdr-ahp",
         "lifecycle": "persistent"
       },
       "subscriptions": [

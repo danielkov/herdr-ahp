@@ -74,15 +74,12 @@ def main():
         def pane():
             return cli("pane", "get", pane_id)["result"]["pane"]
 
-        context_path = root / "context.json"
-        context_path.write_text(json.dumps({
-            "source": "org.example.herdr-ahp.live-sdk", "agent": "sdk-smoke-agent",
-            "sequence_file": str(root / "sequence"), "event_source": "urn:example:agent",
-            "resume_argv": ["sh", "-c", "printf resumed-sdk-smoke-{session_id}"], "release_on_eof": False,
-        }))
+        bridge_args = ["--source", "org.example.herdr-ahp.live-sdk", "--agent", "sdk-smoke-agent",
+                       "--event-source", "urn:example:agent"]
+        resume_args = ["--", "sh", "-c", "printf resumed-sdk-smoke-{session_id}"]
         sample = "registration-with-interactions.json" if args.interactions else "registration.json"
         registration = json.loads((repo / "examples" / sample).read_text())
-        registration["hooks"][0]["transport"].update(command=str(bridge), args=["--config", str(context_path)])
+        registration["hooks"][0]["transport"].update(command=str(bridge), args=bridge_args + resume_args)
         registration_path = root / "registration.json"
         registration_path.write_text(json.dumps(registration))
         fifo = root / "events.fifo"
@@ -94,7 +91,7 @@ def main():
         q = shlex.quote
         command = (f"{q(str(driver))} {q(str(registration_path))} < {q(str(fifo))} "
                    f"> {q(str(root / 'acks.jsonl'))} 2> {q(str(root / 'driver.stderr'))}; "
-                   f"driver_rc=$?; {q(str(bridge))} --config {q(str(context_path))} --release; "
+                   f"driver_rc=$?; {shlex.join([str(bridge)] + bridge_args + ['--release'])}; "
                    f"release_rc=$?; printf '%s %s\\n' \"$driver_rc\" \"$release_rc\" > {q(str(root / 'driver-exit'))}; sleep 30")
         cli("pane", "run", pane_id, "sh -c " + q(command))
         count = 0
@@ -131,9 +128,7 @@ def main():
                 return current if current.get("agent") == "sdk-smoke-agent" and current.get("agent_status") in states else None
             current = wait(accepted, "State did not match " + kind)
             evidence["checks"].append({"event": kind, "agent": current["agent"], "state": current["agent_status"]})
-        previous = int((root / "sequence").read_text())
         emit("session.start", "live-session-2")
-        wait(lambda: int((root / "sequence").read_text()) > previous, "Session switch did not consume a new sequence")
         time.sleep(0.35)  # Allow bounded CLI reporting to finish before host shutdown.
         current = pane()
         assert current.get("agent") == "sdk-smoke-agent" and current.get("agent_status") in {"idle", "done"}
