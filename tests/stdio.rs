@@ -226,7 +226,8 @@ fn invalid_framing_does_not_release_and_uncertain_report_does() {
 #[test]
 fn sdk_registered_process_observe_smoke() {
     use agenthooksprotocol::{
-        generated::{self as g, ergonomic_inputs::*},
+        generated as g,
+        inputs::*,
         hooks::{Hooks, HooksOptions},
         registration::Registration,
     };

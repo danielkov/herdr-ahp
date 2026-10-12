@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "agenthooksprotocol"
-version = "0.1.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3cbbee5580a4a6dfbb2e6db3c97fb779ce987c89b4b8ac4dd2e34c7bb9b04af1"
+checksum = "50c2533a076331a2f48075ce3fba169117c46896c9677a7b7f8770877cd1a58b"
 dependencies = [
  "jsonschema",
  "serde",

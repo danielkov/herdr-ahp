@@ -74,7 +74,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let server = Server {
         handler: Bridge(Reporter::start(config)?),
         authenticator: LocalProcess,
-        max_body_bytes: 1024 * 1024,
+        max_body_bytes: 4 * 1024 * 1024,
     };
     let mut stdin = io::stdin().lock();
     // Do not retain stdout lock while waiting on stdin: process spawning may

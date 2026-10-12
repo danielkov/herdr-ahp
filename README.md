@@ -2,7 +2,7 @@
 
 A generic, observe-only Agent Hooks Protocol hook
 server that reports an agent's state to [HerdR](https://herdr.dev/docs/add-herdr-support/).
-It uses the published `agenthooksprotocol` 0.1.0 **server dispatcher and stdio
+It uses the published `agenthooksprotocol` 0.4.0 **server dispatcher and stdio
 adapter**, not a host-specific hook format. It has no host application state or
 agent-specific integration code. This repository has no GitHub remote.
 
