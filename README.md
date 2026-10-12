@@ -1,222 +1,135 @@
 # herdr-ahp
 
-A generic, observe-only Agent Hooks Protocol hook
-server that reports an agent's state to [HerdR](https://herdr.dev/docs/add-herdr-support/).
-It uses the published `agenthooksprotocol` 0.4.0 **server dispatcher and stdio
-adapter**, not a host-specific hook format. It has no host application state or
-agent-specific integration code. This repository has no GitHub remote.
+Observe-only [Agent Hooks Protocol](https://github.com/agenthooksprotocol/rust-sdk) hook
+that reports an agent's state to [HerdR](https://herdr.dev/docs/add-herdr-support/).
+Runs as a persistent stdio hook built on the `agenthooksprotocol` server dispatcher.
 
-## Build and configure
+## Build
 
-Rust 1.89+ is required (standard-library file locking). Direct dependencies are
-exactly pinned, SDK default features are disabled, and `Cargo.lock` is committed.
-Tokio/process SDK support is test-only; the release bridge uses standard threads.
+Requires Rust 1.89+.
 
 ```sh
 cargo build --release --locked
-# Binary: target/release/herdr-ahp
 cargo test --locked
-cargo clippy --all-targets --locked -- -D warnings
 ```
 
-Copy `examples/adapter-context.json` and the **minimal**
-`examples/registration.json`, replacing all example paths, identities, and resume
-options. The minimal registration subscribes only to `session.start`, `turn.start`,
-and `turn.end`, so it works with hosts that implement session/turn boundaries but
-not approval or elicitation workflows. `examples/registration-with-interactions.json`
-is a separate optional full registration for hosts that actually implement those
-interaction boundaries. `source` identifies **your
-integration**, remains stable across restarts, and must not use HerdR's reserved
-`herdr:` prefix. `agent` is the actual agent's user-visible name, not the bridge
-name or another vendor's name. AHP event `source` is separate; optional
-`event_source` restricts it but is not authentication.
+## Configure
 
-The host owns adapter context. Set `resume_argv` to the actual command that reopens
-the current session, including model and permission options. `{session_id}` is
-substituted in each argument, never evaluated by a shell. An empty array disables
-resume reporting. The first argument must be a plain command on PATH; arguments
-cannot contain apostrophes/control characters; maximum 64 arguments/8 KiB.
-Invalid substituted argv is omitted **without discarding state**. Resume needs
-HerdR 0.9.2+. Restart the hook with new context if host options change; a session
-switch alone does not require restarting it.
+Copy `examples/adapter-context.json` and replace the example values:
 
-Create the parent directory of `sequence_file` first. Use a private local,
-non-symlink path unique to the `(HerdR server, pane, source)` tuple; do not share it
-with another pane or reporter. Keep this file across sessions, upgrades and
-restarts. Do not delete it to fix ownership conflicts. The host must materialize
-pane-dependent paths; config does not expand environment variables or `~`.
+| Field | Meaning |
+| --- | --- |
+| `source` | Stable ID of your integration. Must not start with `herdr:`. |
+| `agent` | User-visible agent name. |
+| `sequence_file` | Absolute path to a private file, unique per (HerdR server, pane, source). Keep it across restarts. Its parent directory must exist. |
+| `resume_argv` | Command that reopens a session. `{session_id}` is substituted; no shell is involved. The first argument must be a bare command on `PATH`. Max 64 args / 8 KiB, no apostrophes or control characters. Empty disables resume. Needs HerdR 0.9.2+. |
+| `event_source` | Optional. Ignore events whose AHP `source` differs. |
+| `session_id` | Optional. Ignore events from other sessions. |
+| `release_on_eof` | Release the pane on clean stdin EOF. Default `false`; see [Exit](#exit). |
 
-## Canonical SDK registration and grants
+Paths are used verbatim: no `~` or environment variable expansion.
 
-Load `examples/registration.json` as the SDK `Registration`. Use the built-in
-**persistent stdio registered process transport**, not `per_event`. The hook
-inherits its environment from the host. SDK 0.1.0's process backend supports
-`command`, `args`, `cwd`, and `lifecycle`; it does **not** apply an `env` map.
-Only a trusted local host should have access to the child stdin. No bearer token
-or network listener is involved.
+## Register
 
-Registration selects routes; it does not grant authority. The host separately
-declares exact **observe** grants for every subscribed event:
+Use `examples/registration.json` (session and turn events) or
+`examples/registration-with-interactions.json` (adds permission and elicitation
+events) with the SDK's persistent stdio transport. Grant observe on every
+subscribed event:
 
 ```rust
-use agenthooksprotocol::{generated as g, hooks::{Hooks, HooksOptions}, registration::Registration};
+use agenthooksprotocol::{
+    capability::{self, HostCapabilities, Observe},
+    hooks::{Hooks, HooksOptions},
+    registration::Registration,
+};
 let registration: Registration = serde_json::from_str(registration_json)?;
-let options = HooksOptions::from_declarations("urn:example:agent", [
-    (g::EventType::SessionStart, g::capability::observe()),
-    (g::EventType::TurnStart, g::capability::observe()),
-    (g::EventType::TurnEnd, g::capability::observe()),
-])?;
+let options = HooksOptions::new("urn:example:agent", HostCapabilities {
+    session_start: Some(capability::session_start().observe()),
+    turn_start: Some(capability::turn_start().observe()),
+    turn_end: Some(Observe),
+    ..Default::default()
+});
 let hooks = Hooks::new(registration, options)?;
 ```
 
-When opting into the interaction registration, additionally grant exactly
-`ToolPermissionRequest`, `ToolPermissionResolved`, `UserElicitationRequest`, and
-`UserElicitationResult` with `g::capability::observe()`. Do not infer host support
-or authority merely from a registration file.
+`examples/sdk_driver.rs` shows the full interaction grant set. The SDK process
+transport does not apply an `env` map, so the hook inherits the host's environment.
 
-The host needs SDK feature `tokio-process` and its own Tokio runtime to deliver
-registered process calls. Use its typed event boundaries and await observation
-delivery. `tests/stdio.rs::sdk_registered_process_observe_smoke` demonstrates this
-with a real SDK client/process backend. Do not add intercept capabilities,
-wildcards, inline content grants, or `failurePolicy` to these observe-only routes.
-The bridge supports observations only; discovery/intercept requests are rejected
-by the SDK dispatcher. JSON is framed as bounded **newline-delimited** objects
-(not Content-Length framing). Successful observations produce no stdout frame.
-All diagnostics go to stderr, and CLI stdout/stderr are discarded.
-
-## Event → state contract
+## Event mapping
 
 | AHP event | HerdR state |
 | --- | --- |
-| `session.start` | `idle`, with the new session's resume argv |
+| `session.start` | `idle` |
 | `turn.start` | `working` |
-| `turn.end` | `idle` (including failed/cancelled turns) |
-| `tool.permission.request` | `blocked`, message `Tool permission required` |
-| `user.elicitation.request` | `blocked`, message `User input required` |
+| `turn.end` | `idle` |
+| `tool.permission.request` | `blocked` — "Tool permission required" |
+| `user.elicitation.request` | `blocked` — "User input required" |
 | `tool.permission.resolved`, `user.elicitation.result` | `working` |
-| all others, including `session.end`, `turn.finish.before`, `user.attention` | no state change, **no release** |
+| anything else | ignored |
 
-Each state report uses `pane report-agent <pane> --source ... --agent ... --state
-... --seq ...`. Blocked reports add `--message`. Valid configured resume data adds
-`--agent-session-id <session> -- <argv...>` to **the same report**, satisfying
-HerdR's ownership-before-resume rule. Messages are fixed labels: prompt/tool
-content is never copied into HerdR.
+Each change runs `herdr pane report-agent` with `--source`, `--agent`, `--state`
+and `--seq`. When `resume_argv` is set, the same call carries
+`--agent-session-id <session> -- <argv...>`. Prompt and tool content is never sent
+to HerdR.
 
-The host must provide a session ID on mapped events and deliver an ordered stream
-for the foreground agent. If it multiplexes child agents, route only foreground
-events or set `session_id` to restrict a fixed session. This is a state projection,
-not a task scheduler: it does not count overlapping approval requests, infer
-whether an elicitation cancellation ends a turn, or infer work from tool progress.
-The host should emit `turn.end` after a stopped turn. Informational attention,
-pre-finish interceptions, and intermediate tool completion do not imply readiness.
+Events must carry a session ID and arrive in order. If the host emits subagent
+events, set `session_id` or route only foreground events.
 
-## Reporting, ownership and actual exit
+## Reporting
 
-Reporting activates only with **all** of `HERDR_ENV=1`, `HERDR_BIN_PATH`,
-`HERDR_PANE_ID`, and `HERDR_SOCKET_PATH` set/nonempty. Outside HerdR, no CLI,
-sequence file, or reporter thread is created; the AHP server still accepts events.
-The portable CLI boundary is used, not platform-specific socket code.
+Reporting is enabled only when `HERDR_ENV=1` and `HERDR_BIN_PATH`, `HERDR_PANE_ID`
+and `HERDR_SOCKET_PATH` are all set. Otherwise the hook accepts events and does
+nothing.
 
-A worker serializes reports with a 300 ms subprocess timeout and one replaceable
-pending-state slot. While a command is in flight, newer changes replace older
-pending changes. Successful identical reports are deduplicated. An uncertain
-failure invalidates that baseline, so a later old state is sent again. CLI
-failures are ignored. Sequence-storage/worker startup failures disable reporting
-with a stderr warning, without breaking protocol service. There is no retry queue.
+- One worker thread runs the CLI with a 300 ms timeout. State changes that arrive
+  while a call is in flight are coalesced to the newest.
+- A repeat of the last successfully reported state is skipped. A failed or
+  timed-out call clears that, so the next state is always sent.
+- `--seq` is `max(previous + 1, unix_time_ms)`, written to `sequence_file`
+  before each call. An exclusive file lock stops a second hook from using the
+  same file; a locked or corrupt file disables reporting.
+- Diagnostics go to stderr. The hook never writes to stdout for observations.
 
-An exclusive standard-library file lock prevents concurrent writers using the
-same sequence file. Every attempted report/release consumes a persisted sequence
-number `max(previous + 1, unix_time_ms)` **before** spawning the CLI. This survives
-clock rollback and process restarts. Corrupt storage fails closed, not reset to
-zero. Use durable local storage; unexpected power loss/storage failure may require
-operator repair. Different files for the same source/pane defeat this guarantee.
-Source ownership is claimed by state reports, not merely by starting the bridge.
+## Exit
 
-**Transport shutdown is not agent exit.** Default `release_on_eof: false` never
-releases on `session.end`, session switches, SDK shutdown, hook restarts, framing
-errors, or drop. HerdR's idle-shell detection is a fallback, not a substitute for
-an adapter exit contract. The host must arrange a real quit signal:
+Stopping the hook does not release the pane. Pick one:
 
-* If clean stdin EOF is guaranteed to occur **only when the actual agent quits**,
-  set `release_on_eof: true` and close stdin on that lifecycle boundary. The hook
-  drains the latest state, then sends a higher-sequence source-scoped
-  `pane release-agent`, including after uncertain state acceptance.
-* Otherwise leave it false. A host-side lifecycle supervisor must call the explicit exit command
-  **after the actual agent quits and this hook stops**:
-  `herdr-ahp --config /absolute/path/to/adapter-context.json --release`.
-  It uses the same locked durable sequence store and source-scoped release;
-  reporting failures remain non-fatal and no stdout is emitted. Do not enable the flag for ordinary SDK process shutdown:
-  SDK 0.1.0 shutdown can kill its child, so it cannot guarantee graceful release.
+- **Clean EOF means the agent quit:** set `release_on_eof: true`. On clean stdin
+  EOF the hook sends the latest state, then `pane release-agent`.
+- **Otherwise:** after the agent quits and the hook stops, run
+  `herdr-ahp --config <adapter-context.json> --release`.
 
-SIGKILL/crashes cannot execute cleanup; no claim of unconditional release is made.
-The CLI timeout bounds external commands, not OS process creation, filesystem
-sync, scheduler latency, or kernel kill/reap latency. Avoid slow/network sequence
-storage. Reporter shutdown joins its owned thread; it does not detach children.
+The SDK's `shutdown()` kills the child, so it never counts as a clean EOF.
 
-## Smoke tests
+## Testing
 
 ```sh
-# SDK registered process transport and actual observe-only grants:
-cargo test --locked --test stdio sdk_registered_process_observe_smoke
-# Fake external CLI boundary: working → blocked → idle, resume argv, seq/release:
-cargo test --locked --test stdio maps_states_resume_and_actual_exit_opt_in
-# Coalescing, timeout, uncertain acceptance, storage and ownership failures:
 cargo test --locked
 ```
 
-Unix boundary tests use a shell script as a fake external CLI; they do not need a
-real pane. Library tests are portable. For a manual no-HerdR stdio smoke, write a
-valid adapter context with real paths, then (stdin terminates cleanly):
+The tests in `tests/stdio.rs` (Unix only) use a shell script in place of the HerdR CLI.
+
+Manual smoke test outside HerdR (expect no output, exit 0):
 
 ```sh
 printf '%s\n' '{"jsonrpc":"2.0","method":"hooks/observe","params":{"protocolVersion":"draft","event":{"id":"evt-smoke","source":"urn:example:agent","type":"turn.start","time":"2026-10-07T12:00:00Z","session":{"id":"session-smoke"},"turn":{"id":"turn-smoke"},"trigger":"user","items":[]}}}' \
   | HERDR_ENV=0 target/release/herdr-ahp --config /absolute/path/to/adapter-context.json
 ```
 
-Expected stdout: empty, exit status 0. In a **real HerdR pane**, register the hook
-with your agent, then check `herdr agent list` while starting a turn, blocking on a
-permission, finishing, switching sessions, and quitting. Test restore by restarting
-the HerdR server and verify the configured command resumes the session. No server-restart
-restore testing has been performed here. Isolated live state/release validation
-has since passed on HerdR 0.9.3; see `LIVE_VALIDATION.md`.
-
-See `DEPENDENCY_AUDIT.md` for the accepted reduced dependency selection:
-previously vetted exact releases and approved SDK-family provenance are reused,
-not misrepresented as a fresh independent audit of every transitive package.
-
-### Reusable SDK demonstration host
-
-`examples/sdk_driver.rs` reads canonical event objects as newline-delimited JSON,
-uses the SDK's validated client and registered process transport, and emits JSON
-acknowledgements. Those acknowledgements mean delivery to hook stdin, not that
-HerdR has applied the report. `{"shutdown":true}` is a demonstration-host control
-line (not an AHP event); it shuts down the hook transport without claiming the
-actual host quit or automatically releasing a pane.
+`examples/sdk_driver.rs` is a demo host. It reads event JSON lines from stdin,
+sends them to the hook through the SDK and prints one ack per event.
+`{"shutdown":true}` stops it.
 
 ```sh
 cargo build --locked --example sdk_driver
-# Use a registration with configured absolute binary/context paths. Force a
-# no-HerdR smoke outside an explicitly isolated live test pane:
 HERDR_ENV=0 target/debug/examples/sdk_driver /absolute/path/to/registration.json
 ```
 
-For live experiments, create a uniquely named headless HerdR session and a pane
-in **that session**. Run the driver as a foreground command there, check each
-state via named-session `pane get`, then release on actual driver exit and stop/
-delete only the resources created for the test. Never substitute the inherited
-production pane/socket or stop the unnamed/default session.
-
-The opt-in Unix live helper automates this isolation and cleanup:
+`scripts/live_smoke.py` runs the driver against a real HerdR in a throwaway named
+session, then deletes it:
 
 ```sh
-cargo build --release --locked
-cargo build --example sdk_driver --locked
-python3 scripts/live_smoke.py                 # Minimal session/turn subset
-python3 scripts/live_smoke.py --interactions  # Optional permission events
+cargo build --release --locked && cargo build --example sdk_driver --locked
+python3 scripts/live_smoke.py                 # session/turn events
+python3 scripts/live_smoke.py --interactions  # plus permission events
 ```
-
-It refuses existing sessions, strips inherited HerdR caller context from control
-commands, verifies a different named socket, creates a test pane, runs the actual
-SDK driver there, and stops/deletes only its uniquely named session. Evidence is
-retained in a private temporary directory. It does not restart or restore the
-server, and does not inspect/change production-pane agent or resume data.

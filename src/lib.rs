@@ -1,11 +1,12 @@
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
+    ffi::{OsStr, OsString},
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Condvar, Mutex},
+    sync::mpsc,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -27,7 +28,7 @@ pub struct Config {
     /// Restrict to one session if a host also emits subagent events.
     #[serde(default)]
     pub session_id: Option<String>,
-    /// Only enable when clean transport EOF proves the host agent actually quit.
+    /// Release on clean stdin EOF. Enable only if EOF means the agent quit.
     #[serde(default)]
     pub release_on_eof: bool,
 }
@@ -98,8 +99,8 @@ fn map_event(config: &Config, event: &Value) -> Option<Report> {
         "tool.permission.request" => ("blocked", Some("Tool permission required")),
         "user.elicitation.request" => ("blocked", Some("User input required")),
         "tool.permission.resolved" | "user.elicitation.result" => ("working", None),
-        // session.end can be a switch, and finish.before can still be intercepted.
-        // user.attention is not necessarily a decision. Neither implies state/exit.
+        // session.end may be a session switch; turn.finish.before and
+        // user.attention don't imply a state change.
         _ => return None,
     };
     let argv: Vec<_> = config
@@ -108,7 +109,7 @@ fn map_event(config: &Config, event: &Value) -> Option<Report> {
         .map(|a| a.replace("{session_id}", session))
         .collect();
     // Never attach invalid resume data: it would reject the entire state report.
-    let argv = if argv.is_empty() || validate_argv(&argv).is_ok() {
+    let argv = if validate_argv(&argv).is_ok() {
         argv
     } else {
         Vec::new()
@@ -121,144 +122,136 @@ fn map_event(config: &Config, event: &Value) -> Option<Report> {
     })
 }
 
-// Shared-state inventory: the handler writes `latest`; finish writes `closed` and
-// release; the worker takes latest. Each guarded transition is a complete value
-// assignment/take; no I/O, callbacks, awaits, or replaced-value drops under lock.
-// Poison is NOT recovered: reporting stops; the agent/protocol continue.
-#[derive(Default)]
-struct Pending {
-    latest: Option<Report>,
-    closed: bool,
-    release: bool,
+/// HerdR CLI target. Reporting requires all of `HERDR_ENV=1`, `HERDR_BIN_PATH`,
+/// `HERDR_PANE_ID` and `HERDR_SOCKET_PATH`; the CLI reads the socket itself.
+struct Herdr {
+    bin: OsString,
+    pane: OsString,
+    source: String,
+    agent: String,
 }
-struct Mailbox {
-    pending: Mutex<Pending>,
-    ready: Condvar,
-}
-pub struct Reporter {
-    config: Config,
-    mailbox: Arc<Mailbox>,
-    worker: Option<thread::JoinHandle<()>>,
-}
-fn herdr_target() -> Option<(std::ffi::OsString, std::ffi::OsString)> {
-    if std::env::var("HERDR_ENV").ok().as_deref() == Some("1") {
-        let bin = std::env::var_os("HERDR_BIN_PATH").filter(|v| !v.is_empty());
-        let pane = std::env::var_os("HERDR_PANE_ID").filter(|v| !v.is_empty());
-        let socket = std::env::var_os("HERDR_SOCKET_PATH").filter(|v| !v.is_empty());
-        match (bin, pane, socket) {
-            (Some(bin), Some(pane), Some(_)) => Some((bin, pane)),
-            _ => None,
+impl Herdr {
+    fn from_env(config: &Config) -> Option<Self> {
+        let var = |key| std::env::var_os(key).filter(|v| !v.is_empty());
+        if std::env::var("HERDR_ENV").ok().as_deref() != Some("1") {
+            return None;
         }
-    } else {
-        None
+        var("HERDR_SOCKET_PATH")?;
+        Some(Self {
+            bin: var("HERDR_BIN_PATH")?,
+            pane: var("HERDR_PANE_ID")?,
+            source: config.source.clone(),
+            agent: config.agent.clone(),
+        })
     }
-}
-/// Explicit host lifecycle signal. Call only after the real agent quits and its
-/// persistent hook stops, never for session replacement or ordinary hook shutdown.
-pub fn release(config: &Config) {
-    let Some((bin, pane)) = herdr_target() else {
-        return;
-    };
-    let attempt = || -> io::Result<()> {
-        let mut sequence = Sequence::open(&config.sequence_file)?;
-        let seq = sequence.next()?;
-        let args = vec![
+    fn run(&self, command: &str, seq: u64, extra: Vec<OsString>) -> Option<bool> {
+        let mut args: Vec<OsString> = vec![
             "pane".into(),
-            "release-agent".into(),
-            pane,
+            command.into(),
+            self.pane.clone(),
             "--source".into(),
-            config.source.clone().into(),
+            self.source.clone().into(),
             "--agent".into(),
-            config.agent.clone().into(),
+            self.agent.clone().into(),
             "--seq".into(),
             seq.to_string().into(),
         ];
-        let _ = run_command(&bin, &args);
-        Ok(())
-    };
-    if attempt().is_err() {
-        eprintln!("herdr-ahp: release skipped (sequence storage unavailable or owned)");
+        args.extend(extra);
+        run_command(&self.bin, &args)
+    }
+    fn report(&self, seq: u64, report: &Report) -> Option<bool> {
+        let mut extra: Vec<OsString> = vec!["--state".into(), report.state.into()];
+        if let Some(message) = report.message {
+            extra.extend(["--message".into(), message.into()]);
+        }
+        // Resume data rides on the same report: ownership before resume.
+        if !report.argv.is_empty() {
+            extra.extend([
+                "--agent-session-id".into(),
+                report.session.clone().into(),
+                "--".into(),
+            ]);
+            extra.extend(report.argv.iter().map(Into::into));
+        }
+        self.run("report-agent", seq, extra)
+    }
+    fn release(&self, seq: u64) -> Option<bool> {
+        self.run("release-agent", seq, Vec::new())
     }
 }
+/// Release the pane. Run only after the agent quits and the hook has stopped.
+pub fn release(config: &Config) {
+    let Some(herdr) = Herdr::from_env(config) else {
+        return;
+    };
+    match Sequence::open(&config.sequence_file).and_then(|mut s| s.next()) {
+        Ok(seq) => {
+            herdr.release(seq);
+        }
+        Err(_) => eprintln!("herdr-ahp: release skipped (sequence storage unavailable or owned)"),
+    }
+}
+enum Message {
+    Report(Report),
+    Finish { release: bool },
+}
+pub struct Reporter {
+    config: Config,
+    tx: Option<mpsc::Sender<Message>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
 impl Reporter {
-    pub fn start(config: Config) -> io::Result<Self> {
-        let mailbox = Arc::new(Mailbox {
-            pending: Mutex::new(Pending::default()),
-            ready: Condvar::new(),
-        });
-        let target = herdr_target();
-        let worker = if let Some((bin, pane)) = target {
-            // Lock and durable sequence belong exclusively to the worker. A second
-            // bridge for this same source/pane fails closed, never steals ownership.
-            let sequence = match Sequence::open(&config.sequence_file) {
-                Ok(sequence) => sequence,
-                Err(_) => {
-                    eprintln!(
-                        "herdr-ahp: reporting disabled (sequence storage unavailable or owned)"
-                    );
-                    return Ok(Self {
-                        config,
-                        mailbox,
-                        worker: None,
-                    });
-                }
-            };
-            let m = mailbox.clone();
-            let c = config.clone();
-            match thread::Builder::new()
-                .name("herdr-reporter".into())
-                .spawn(move || {
-                    run_worker(m, c, sequence, bin, pane);
-                }) {
-                Ok(worker) => Some(worker),
-                Err(_) => {
-                    eprintln!("herdr-ahp: reporting disabled (worker unavailable)");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        Ok(Self {
+    /// Outside HerdR, or if sequence storage/worker startup fails, reporting is
+    /// disabled but the protocol server keeps running.
+    pub fn start(config: Config) -> Self {
+        let disabled = |config| Self {
             config,
-            mailbox,
-            worker,
-        })
+            tx: None,
+            worker: None,
+        };
+        let Some(herdr) = Herdr::from_env(&config) else {
+            return disabled(config);
+        };
+        // The file lock stops a second hook for this pane from reporting.
+        let Ok(sequence) = Sequence::open(&config.sequence_file) else {
+            eprintln!("herdr-ahp: reporting disabled (sequence storage unavailable or owned)");
+            return disabled(config);
+        };
+        let (tx, rx) = mpsc::channel();
+        match thread::Builder::new()
+            .name("herdr-reporter".into())
+            .spawn(move || run_worker(rx, herdr, sequence))
+        {
+            Ok(worker) => Self {
+                config,
+                tx: Some(tx),
+                worker: Some(worker),
+            },
+            Err(_) => {
+                eprintln!("herdr-ahp: reporting disabled (worker unavailable)");
+                disabled(config)
+            }
+        }
     }
     pub fn observe(&self, event: &Value) {
-        if self.worker.is_none() {
-            return;
-        }
-        let Some(report) = map_event(&self.config, event) else {
-            return;
-        };
-        if let Ok(mut guard) = self.mailbox.pending.lock() {
-            if guard.closed {
-                return;
-            }
-            let old = guard.latest.replace(report);
-            drop(guard);
-            drop(old);
-            self.mailbox.ready.notify_one();
+        if let Some(tx) = &self.tx
+            && let Some(report) = map_event(&self.config, event)
+        {
+            let _ = tx.send(Message::Report(report));
         }
     }
+    /// Drain the latest state; release only if clean EOF proves actual agent exit.
     pub fn finish(&self, clean_eof: bool) {
-        if let Ok(mut guard) = self.mailbox.pending.lock() {
-            guard.closed = true;
-            guard.release = clean_eof && self.config.release_on_eof;
-            drop(guard);
+        if let Some(tx) = &self.tx {
+            let release = clean_eof && self.config.release_on_eof;
+            let _ = tx.send(Message::Finish { release });
         }
-        self.mailbox.ready.notify_one();
     }
 }
 impl Drop for Reporter {
     fn drop(&mut self) {
-        // Unwind/protocol failure/drop is not evidence of host exit.
-        if let Ok(mut guard) = self.mailbox.pending.lock() {
-            guard.closed = true;
-            drop(guard);
-        }
-        self.mailbox.ready.notify_one();
+        // Closing the channel without `Finish` (unwind, protocol failure) never releases.
+        self.tx.take();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -269,7 +262,7 @@ struct Sequence {
     last: u64,
 }
 impl Sequence {
-    fn open(path: &std::path::Path) -> io::Result<Self> {
+    fn open(path: &Path) -> io::Result<Self> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
@@ -288,6 +281,7 @@ impl Sequence {
         };
         Ok(Self { file, last })
     }
+    /// `max(previous + 1, unix_time_ms)`, persisted before the command is sent.
     fn next(&mut self) -> io::Result<u64> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -298,38 +292,29 @@ impl Sequence {
             .checked_add(1)
             .ok_or_else(|| io::Error::other("sequence exhausted"))?
             .max(u64::try_from(now).map_err(io::Error::other)?);
+        let line = format!("{next}\n");
         self.file.seek(SeekFrom::Start(0))?;
-        // Persist before sending. A failed command still consumes its number.
-        writeln!(self.file, "{next}")?;
-        self.file.set_len(next.to_string().len() as u64 + 1)?;
+        self.file.write_all(line.as_bytes())?;
+        self.file.set_len(line.len() as u64)?;
         self.file.sync_data()?;
         self.last = next;
         Ok(next)
     }
 }
-fn run_worker(
-    mailbox: Arc<Mailbox>,
-    config: Config,
-    mut sequence: Sequence,
-    bin: std::ffi::OsString,
-    pane: std::ffi::OsString,
-) {
+fn run_worker(rx: mpsc::Receiver<Message>, herdr: Herdr, mut sequence: Sequence) {
     let mut last_success: Option<Report> = None;
     let mut owned = false;
-    loop {
-        let (report, closed, release) = {
-            let Ok(mut guard) = mailbox.pending.lock() else {
-                return;
-            };
-            while guard.latest.is_none() && !guard.closed {
-                guard = match mailbox.ready.wait(guard) {
-                    Ok(g) => g,
-                    Err(_) => return,
-                };
+    while let Ok(first) = rx.recv() {
+        // Coalesce whatever queued while the previous command ran: only the
+        // newest state is worth sending.
+        let (mut latest, mut finish) = (None, None);
+        for message in std::iter::once(first).chain(rx.try_iter()) {
+            match message {
+                Message::Report(report) => latest = Some(report),
+                Message::Finish { release } => finish = Some(release),
             }
-            (guard.latest.take(), guard.closed, guard.release)
-        };
-        if let Some(report) = report
+        }
+        if let Some(report) = latest
             && last_success.as_ref() != Some(&report)
         {
             // A timeout/nonzero exit may follow server acceptance. Never use a
@@ -338,60 +323,25 @@ fn run_worker(
             let Ok(seq) = sequence.next() else {
                 return;
             };
-            let mut args = vec![
-                "pane".into(),
-                "report-agent".into(),
-                pane.clone(),
-                "--source".into(),
-                config.source.clone().into(),
-                "--agent".into(),
-                config.agent.clone().into(),
-                "--state".into(),
-                report.state.into(),
-                "--seq".into(),
-                seq.to_string().into(),
-            ];
-            if let Some(message) = report.message {
-                args.extend(["--message".into(), message.into()]);
-            }
-            if !report.argv.is_empty() {
-                args.extend([
-                    "--agent-session-id".into(),
-                    report.session.clone().into(),
-                    "--".into(),
-                ]);
-                args.extend(report.argv.iter().map(Into::into));
-            }
-            if let Some(success) = run_command(&bin, &args) {
+            if let Some(success) = herdr.report(seq, &report) {
                 owned = true; // Source-scoped release is safe after possible acquisition.
                 if success {
                     last_success = Some(report);
                 }
             }
         }
-        if closed {
+        if let Some(release) = finish {
             if release
                 && owned
                 && let Ok(seq) = sequence.next()
             {
-                let args = vec![
-                    "pane".into(),
-                    "release-agent".into(),
-                    pane.clone(),
-                    "--source".into(),
-                    config.source.clone().into(),
-                    "--agent".into(),
-                    config.agent.clone().into(),
-                    "--seq".into(),
-                    seq.to_string().into(),
-                ];
-                let _ = run_command(&bin, &args);
+                herdr.release(seq);
             }
             return;
         }
     }
 }
-fn run_command(bin: &std::ffi::OsStr, args: &[std::ffi::OsString]) -> Option<bool> {
+fn run_command(bin: &OsStr, args: &[OsString]) -> Option<bool> {
     let Ok(mut child) = Command::new(bin)
         .args(args)
         .stdin(Stdio::null())
@@ -521,94 +471,5 @@ mod tests {
         std::fs::write(&path, "corrupt").unwrap();
         assert!(Sequence::open(&path).is_err());
         std::fs::remove_file(path).unwrap();
-    }
-    #[test]
-    fn poisoned_waiting_worker_is_notified_and_joined() {
-        let path = std::env::temp_dir().join(format!("herdr-poison-test-{}", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let sequence = Sequence::open(&path).unwrap();
-        let mailbox = Arc::new(Mailbox {
-            pending: Mutex::new(Pending::default()),
-            ready: Condvar::new(),
-        });
-        let m = mailbox.clone();
-        let c = config();
-        let worker =
-            thread::spawn(move || run_worker(m, c, sequence, "unused".into(), "pane".into()));
-        let reporter = Reporter {
-            config: config(),
-            mailbox: mailbox.clone(),
-            worker: Some(worker),
-        };
-        thread::sleep(Duration::from_millis(20));
-        let m = mailbox.clone();
-        assert!(
-            thread::spawn(move || {
-                let _guard = m.pending.lock().unwrap();
-                panic!("test poison");
-            })
-            .join()
-            .is_err()
-        );
-        // Drop must notify even though it cannot take the poisoned lock. The
-        // worker exits on poison and is joined; no recovery or release is made.
-        drop(reporter);
-        assert!(mailbox.pending.lock().is_err());
-        std::fs::remove_file(path).unwrap();
-    }
-    #[test]
-    fn mailbox_coalesces_and_poison_disables_reporting() {
-        let mailbox = Arc::new(Mailbox {
-            pending: Mutex::new(Pending::default()),
-            ready: Condvar::new(),
-        });
-        let mut c = config();
-        c.release_on_eof = true;
-        // Dummy worker exists only to admit production observe; it owns no state.
-        let reporter = Reporter {
-            config: c,
-            mailbox: mailbox.clone(),
-            worker: Some(thread::spawn(|| {})),
-        };
-        for name in ["turn.start", "tool.permission.request", "turn.end"] {
-            reporter.observe(&serde_json::json!({"type":name,"session":{"id":"s1"}}));
-        }
-        assert_eq!(
-            mailbox
-                .pending
-                .lock()
-                .unwrap()
-                .latest
-                .as_ref()
-                .unwrap()
-                .state,
-            "idle"
-        );
-        reporter.finish(false);
-        assert!(!mailbox.pending.lock().unwrap().release);
-        reporter.observe(&serde_json::json!({"type":"turn.start","session":{"id":"s1"}}));
-        assert_eq!(
-            mailbox
-                .pending
-                .lock()
-                .unwrap()
-                .latest
-                .as_ref()
-                .unwrap()
-                .state,
-            "idle"
-        );
-        let m = mailbox.clone();
-        assert!(
-            thread::spawn(move || {
-                let _guard = m.pending.lock().unwrap();
-                panic!("test poison");
-            })
-            .join()
-            .is_err()
-        );
-        reporter.finish(true); // Does not recover a poisoned invariant.
-        drop(reporter);
-        assert!(mailbox.pending.lock().is_err());
     }
 }

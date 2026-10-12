@@ -1,4 +1,4 @@
-//! Fake external CLI boundary; does not require or claim a real HerdR pane.
+//! End-to-end tests against a fake HerdR CLI.
 #![cfg(unix)]
 use serde_json::{Value, json};
 use std::{
@@ -226,23 +226,26 @@ fn invalid_framing_does_not_release_and_uncertain_report_does() {
 #[test]
 fn sdk_registered_process_observe_smoke() {
     use agenthooksprotocol::{
+        capability::{self, HostCapabilities},
         generated as g,
-        inputs::*,
         hooks::{Hooks, HooksOptions},
+        inputs::*,
         registration::Registration,
     };
     let f = Fixture::new("sdk", false, "");
-    // Environment is passed canonically by registration; no global env mutations.
+    // Registration has no env map, so set HerdR variables through sh.
     let registration: Registration = serde_json::from_value(json!({"protocolVersion":"draft","hooks":[{
         "id":"org.example.bridge","transport":{"type":"stdio","command":"/bin/sh",
         "args":["-c","export HERDR_ENV=1 HERDR_BIN_PATH=/bin/sh HERDR_PANE_ID=pane-test HERDR_SOCKET_PATH=unused; exec \"$1\" --config \"$2\"", "smoke", env!("CARGO_BIN_EXE_herdr-ahp"), f.config],
         "cwd":f.root,"lifecycle":"persistent"},
         "subscriptions":[{"events":["turn.start"],"mode":"observe","content":{"default":"metadata"}}]}]})).unwrap();
-    let options = HooksOptions::from_declarations(
+    let options = HooksOptions::new(
         "urn:example:host",
-        [(g::EventType::TurnStart, g::capability::observe())],
-    )
-    .unwrap();
+        HostCapabilities {
+            turn_start: Some(capability::turn_start().observe()),
+            ..Default::default()
+        },
+    );
     let hooks = Hooks::new(registration, options).unwrap();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -357,10 +360,19 @@ fn explicit_host_exit_release_uses_shared_sequence_after_hook_stops() {
     assert!(seq(&calls[1]) > seq(&calls[0]));
 }
 
+fn session_turn_grants() -> agenthooksprotocol::capability::HostCapabilities {
+    use agenthooksprotocol::capability::{self, HostCapabilities, Observe};
+    HostCapabilities {
+        session_start: Some(capability::session_start().observe()),
+        turn_start: Some(capability::turn_start().observe()),
+        turn_end: Some(Observe),
+        ..Default::default()
+    }
+}
 #[test]
 fn optional_interaction_example_is_admitted_with_exact_observe_grants() {
     use agenthooksprotocol::{
-        generated as g,
+        capability::{self, HostCapabilities, Observe},
         hooks::{Hooks, HooksOptions},
         registration::Registration,
     };
@@ -371,52 +383,45 @@ fn optional_interaction_example_is_admitted_with_exact_observe_grants() {
         "../examples/registration-with-interactions.json"
     ))
     .unwrap();
-    let options = HooksOptions::from_declarations(
-        "urn:example:agent",
-        [
-            (g::EventType::SessionStart, g::capability::observe()),
-            (g::EventType::TurnStart, g::capability::observe()),
-            (g::EventType::TurnEnd, g::capability::observe()),
-            (
-                g::EventType::ToolPermissionRequest,
-                g::capability::observe(),
-            ),
-            (
-                g::EventType::ToolPermissionResolved,
-                g::capability::observe(),
-            ),
-            (
-                g::EventType::UserElicitationRequest,
-                g::capability::observe(),
-            ),
-            (
-                g::EventType::UserElicitationResult,
-                g::capability::observe(),
-            ),
-        ],
-    )
-    .unwrap();
+    let grants = HostCapabilities {
+        tool_permission_request: Some(capability::tool_permission_request().observe()),
+        tool_permission_resolved: Some(Observe),
+        user_elicitation_request: Some(capability::user_elicitation_request().observe()),
+        user_elicitation_result: Some(capability::user_elicitation_result().observe()),
+        ..session_turn_grants()
+    };
     // Constructor validates canonical registration/grants without launching I/O.
-    Hooks::new(registration, options).unwrap();
+    Hooks::new(registration, HooksOptions::new("urn:example:agent", grants)).unwrap();
 }
 
 #[test]
 fn minimal_registration_requires_only_session_turn_grants() {
     use agenthooksprotocol::{
-        generated as g,
         hooks::{Hooks, HooksOptions},
         registration::Registration,
     };
     let registration: Registration =
         serde_json::from_str(include_str!("../examples/registration.json")).unwrap();
-    let options = HooksOptions::from_declarations(
-        "urn:example:agent",
-        [
-            (g::EventType::SessionStart, g::capability::observe()),
-            (g::EventType::TurnStart, g::capability::observe()),
-            (g::EventType::TurnEnd, g::capability::observe()),
-        ],
+    Hooks::new(
+        registration,
+        HooksOptions::new("urn:example:agent", session_turn_grants()),
     )
     .unwrap();
-    Hooks::new(registration, options).unwrap();
+}
+
+#[test]
+fn rejected_notifications_never_write_stdout() {
+    let f = Fixture::new("rejected", false, "");
+    let mut child = f.spawn(true);
+    // Schema-invalid observation: the SDK rejects it, but a notification gets no reply.
+    send(
+        &mut child,
+        json!({"type":"turn.start","session":{"id":"s1"}}),
+    );
+    send(&mut child, event("turn.start", "s1"));
+    f.wait_calls(1);
+    let out = close(child);
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("rejected notification"));
 }

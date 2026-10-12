@@ -1,8 +1,7 @@
-//! Demo host: SDK client -> registered process hook. Not the hook's protocol loop.
-//! Supply newline-delimited canonical event objects on stdin; SDK binds identity,
-//! validates events, projects content and delivers observe notifications.
+//! Demo host: reads canonical event JSON lines from stdin and delivers them to the
+//! registered hook through the SDK.
 use agenthooksprotocol::{
-    generated as g,
+    capability::{self, HostCapabilities, Observe},
     hooks::{Hooks, HooksOptions},
     registration::Registration,
 };
@@ -15,32 +14,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("unexpected arguments".into());
     }
     let registration: Registration = serde_json::from_slice(&std::fs::read(path)?)?;
-    // Demo host authority is explicit and independent of registration. Production
-    // hosts must grant only the boundaries they actually implement.
-    let options = HooksOptions::from_declarations(
+    // Grant only the events the host actually emits.
+    let options = HooksOptions::new(
         "urn:example:agent",
-        [
-            (g::EventType::SessionStart, g::capability::observe()),
-            (g::EventType::TurnStart, g::capability::observe()),
-            (g::EventType::TurnEnd, g::capability::observe()),
-            (
-                g::EventType::ToolPermissionRequest,
-                g::capability::observe(),
-            ),
-            (
-                g::EventType::ToolPermissionResolved,
-                g::capability::observe(),
-            ),
-            (
-                g::EventType::UserElicitationRequest,
-                g::capability::observe(),
-            ),
-            (
-                g::EventType::UserElicitationResult,
-                g::capability::observe(),
-            ),
-        ],
-    )?;
+        HostCapabilities {
+            session_start: Some(capability::session_start().observe()),
+            turn_start: Some(capability::turn_start().observe()),
+            turn_end: Some(Observe),
+            tool_permission_request: Some(capability::tool_permission_request().observe()),
+            tool_permission_resolved: Some(Observe),
+            user_elicitation_request: Some(capability::user_elicitation_request().observe()),
+            user_elicitation_result: Some(capability::user_elicitation_result().observe()),
+            ..Default::default()
+        },
+    );
     let hooks = Hooks::new(registration, options)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -71,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Ok::<_, Box<dyn std::error::Error>>(())
     });
-    // SDK shutdown is transport cleanup, NOT evidence of actual agent exit.
+    // Kills the hook; does not release the pane.
     runtime.block_on(hooks.shutdown())?;
     result
 }

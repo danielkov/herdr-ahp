@@ -35,21 +35,16 @@ impl Authenticator for LocalProcess {
         })
     }
 }
-struct Bridge(Reporter);
-impl Handler for Bridge {
-    fn handle(&self, _: Principal, message: Incoming) -> HandlerFuture<'_> {
-        Box::pin(async move {
-            match message {
-                Incoming::Observe(notification) => {
-                    let event = serde_json::to_value(notification.params.event)
-                        .map_err(|e| e.to_string())?;
-                    self.0.observe(&event);
-                    Ok(Outgoing::Observed)
-                }
-                _ => Err("This hook supports registered observations only".into()),
-            }
-        })
-    }
+type Observer<E> = Arc<dyn Fn(ObserveContext<E>, E) -> ServerFuture<()> + Send + Sync>;
+/// Mapping is keyed on the canonical event JSON, so every mapped event shares one
+/// callback. Unmapped observations are accepted by the SDK without a handler;
+/// discovery/interception have no handler and are rejected.
+fn forward<E: 'static>(reporter: &Arc<Reporter>) -> Option<Observer<E>> {
+    let reporter = reporter.clone();
+    Some(Arc::new(move |ctx, _| {
+        reporter.observe(&ctx.request()["params"]["event"]);
+        Box::pin(async { Ok(()) })
+    }))
 }
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -71,8 +66,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         herdr_ahp::release(&config);
         return Ok(());
     }
+    let reporter = Arc::new(Reporter::start(config));
+    let mut handlers = HandlerSet::default();
+    let observe = &mut handlers.observe;
+    observe.session_start = forward(&reporter);
+    observe.turn_start = forward(&reporter);
+    observe.turn_end = forward(&reporter);
+    observe.tool_permission_request = forward(&reporter);
+    observe.tool_permission_resolved = forward(&reporter);
+    observe.user_elicitation_request = forward(&reporter);
+    observe.user_elicitation_result = forward(&reporter);
     let server = Server {
-        handler: Bridge(Reporter::start(config)?),
+        handlers,
         authenticator: LocalProcess,
         max_body_bytes: 4 * 1024 * 1024,
     };
@@ -82,13 +87,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut stdout = io::stdout();
     let result = (|| -> io::Result<()> {
         while let Some(frame) = stdio::read_frame(&mut stdin, server.max_body_bytes)? {
+            // JSON-RPC notifications get no reply. The SDK process transport never
+            // reads stdout after `notify`, so an error frame here would sit in the
+            // pipe and desynchronize (or eventually block) the stream.
+            let is_request = serde_json::from_slice::<serde_json::Value>(&frame)
+                .is_ok_and(|message| message.get("id").is_some());
             let response = block_on(stdio::dispatch(&server, frame, None));
-            stdio::write_frame(&mut stdout, &response, server.max_body_bytes)?;
+            if is_request {
+                stdio::write_frame(&mut stdout, &response, server.max_body_bytes)?;
+            } else if response.status >= 400 {
+                eprintln!(
+                    "herdr-ahp: rejected notification: {}",
+                    String::from_utf8_lossy(&response.body)
+                );
+            }
         }
         Ok(())
     })();
-    // EOF is NOT agent exit by default. Opt-in belongs to a lifetime-bound adapter.
-    server.handler.0.finish(result.is_ok());
+    // Only clean EOF with `release_on_eof` releases the pane.
+    reporter.finish(result.is_ok());
+    // Dropping the server and our handle joins the worker after it drains.
+    drop(server);
+    drop(reporter);
     result?;
     Ok(())
 }
