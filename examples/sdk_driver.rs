@@ -1,7 +1,7 @@
 //! Demo host: reads canonical event JSON lines from stdin and delivers them to the
 //! registered hook through the SDK.
 use agenthooksprotocol::{
-    capability::{self, HostCapabilities, Observe},
+    capability::{self, HostCapabilities},
     hooks::{Hooks, HooksOptions},
     registration::Registration,
 };
@@ -20,9 +20,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         HostCapabilities {
             session_start: Some(capability::session_start().observe()),
             turn_start: Some(capability::turn_start().observe()),
-            turn_end: Some(Observe),
+            turn_end: Some(capability::turn_end().observe()),
             tool_permission_request: Some(capability::tool_permission_request().observe()),
-            tool_permission_resolved: Some(Observe),
+            tool_permission_resolved: Some(capability::tool_permission_resolved().observe()),
             user_elicitation_request: Some(capability::user_elicitation_request().observe()),
             user_elicitation_result: Some(capability::user_elicitation_result().observe()),
             ..Default::default()

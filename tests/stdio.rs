@@ -339,18 +339,18 @@ fn explicit_release_after_hook_stops() {
 }
 
 fn session_turn_grants() -> agenthooksprotocol::capability::HostCapabilities {
-    use agenthooksprotocol::capability::{self, HostCapabilities, Observe};
+    use agenthooksprotocol::capability::{self, HostCapabilities};
     HostCapabilities {
         session_start: Some(capability::session_start().observe()),
         turn_start: Some(capability::turn_start().observe()),
-        turn_end: Some(Observe),
+        turn_end: Some(capability::turn_end().observe()),
         ..Default::default()
     }
 }
 #[test]
 fn optional_interaction_example_is_admitted_with_exact_observe_grants() {
     use agenthooksprotocol::{
-        capability::{self, HostCapabilities, Observe},
+        capability::{self, HostCapabilities},
         hooks::{Hooks, HooksOptions},
         registration::Registration,
     };
@@ -360,7 +360,7 @@ fn optional_interaction_example_is_admitted_with_exact_observe_grants() {
     .unwrap();
     let grants = HostCapabilities {
         tool_permission_request: Some(capability::tool_permission_request().observe()),
-        tool_permission_resolved: Some(Observe),
+        tool_permission_resolved: Some(capability::tool_permission_resolved().observe()),
         user_elicitation_request: Some(capability::user_elicitation_request().observe()),
         user_elicitation_result: Some(capability::user_elicitation_result().observe()),
         ..session_turn_grants()
@@ -398,5 +398,4 @@ fn rejected_notifications_never_write_stdout() {
     let out = close(child);
     assert!(out.status.success());
     assert!(out.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("rejected notification"));
 }

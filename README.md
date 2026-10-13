@@ -53,13 +53,13 @@ A harness built on the Rust SDK grants observe on every subscribed event:
 
 ```rust
 use agenthooksprotocol::{
-    capability::{self, HostCapabilities, Observe},
+    capability::{self, HostCapabilities},
     hooks::{Hooks, HooksOptions},
 };
 let options = HooksOptions::new("urn:example:agent", HostCapabilities {
     session_start: Some(capability::session_start().observe()),
     turn_start: Some(capability::turn_start().observe()),
-    turn_end: Some(Observe),
+    turn_end: Some(capability::turn_end().observe()),
     ..Default::default()
 });
 let hooks = Hooks::new(registration, options)?;

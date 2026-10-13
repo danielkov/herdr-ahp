@@ -96,29 +96,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         authenticator: LocalProcess,
         max_body_bytes: 4 * 1024 * 1024,
     };
-    let mut stdin = io::stdin().lock();
-    // Do not retain stdout lock while waiting on stdin: process spawning may
-    // need standard-I/O locks on some platforms. Only this thread writes frames.
-    let mut stdout = io::stdout();
-    let result = (|| -> io::Result<()> {
-        while let Some(frame) = stdio::read_frame(&mut stdin, server.max_body_bytes)? {
-            // JSON-RPC notifications get no reply. The SDK process transport never
-            // reads stdout after `notify`, so an error frame here would sit in the
-            // pipe and desynchronize (or eventually block) the stream.
-            let is_request = serde_json::from_slice::<serde_json::Value>(&frame)
-                .is_ok_and(|message| message.get("id").is_some());
-            let response = block_on(stdio::dispatch(&server, frame, None));
-            if is_request {
-                stdio::write_frame(&mut stdout, &response, server.max_body_bytes)?;
-            } else if response.status >= 400 {
-                eprintln!(
-                    "herdr-ahp: rejected notification: {}",
-                    String::from_utf8_lossy(&response.body)
-                );
-            }
-        }
-        Ok(())
-    })();
+    // Do not retain the stdout lock while waiting on stdin: process spawning may
+    // need standard-I/O locks on some platforms.
+    let result = block_on(stdio::serve(
+        &server,
+        io::stdin().lock(),
+        io::stdout(),
+        None,
+        server.max_body_bytes,
+    ));
     // Only clean EOF with `release_on_eof` releases the pane.
     reporter.finish(result.is_ok());
     // Dropping the server and our handle joins the worker after it drains.
