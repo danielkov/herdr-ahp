@@ -80,10 +80,6 @@ let options = HooksOptions::new("urn:example:agent", Harness::new("example-host"
 let hooks = Hooks::new(registration, options)?;
 ```
 
-SDK 0.7 requires the host's name and version in `HooksOptions`. The SDK adds
-this `harness` identity to every event and rejects conflicting identities.
-Hosts that send JSON-RPC directly must include `harness` on every event.
-
 `examples/sdk_driver.rs` shows the full interaction grant set. The hook inherits
 the harness's environment, which includes HerdR's pane variables.
 
