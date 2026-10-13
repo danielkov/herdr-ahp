@@ -85,6 +85,7 @@ impl Drop for Fixture {
 }
 fn event(kind: &str, session: &str) -> Value {
     let mut e = json!({"id":format!("evt-{kind}"),"type":kind,"time":"2026-10-07T12:00:00Z","source":"urn:example:host",
+        "harness":{"name":"test-host","version":"0.1.0"},
         "session":{"id":session},"turn":{"id":"t1"}});
     match kind {
         "turn.start" => {
@@ -244,6 +245,7 @@ fn sdk_registered_process_observe_smoke() {
         "subscriptions":[{"events":["turn.start"],"mode":"observe","content":{"default":"metadata"}}]}]})).unwrap();
     let options = HooksOptions::new(
         "urn:example:host",
+        g::Harness::new("test-host", "0.1.0"),
         HostCapabilities {
             turn_start: Some(capability::turn_start().observe()),
             ..Default::default()
@@ -366,7 +368,15 @@ fn optional_interaction_example_is_admitted_with_exact_observe_grants() {
         ..session_turn_grants()
     };
     // Constructor validates canonical registration/grants without launching I/O.
-    Hooks::new(registration, HooksOptions::new("urn:example:agent", grants)).unwrap();
+    Hooks::new(
+        registration,
+        HooksOptions::new(
+            "urn:example:agent",
+            agenthooksprotocol::hooks::Harness::new("test-host", "0.1.0"),
+            grants,
+        ),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -379,7 +389,11 @@ fn minimal_registration_requires_only_session_turn_grants() {
         serde_json::from_str(include_str!("../examples/registration.json")).unwrap();
     Hooks::new(
         registration,
-        HooksOptions::new("urn:example:agent", session_turn_grants()),
+        HooksOptions::new(
+            "urn:example:agent",
+            agenthooksprotocol::hooks::Harness::new("test-host", "0.1.0"),
+            session_turn_grants(),
+        ),
     )
     .unwrap();
 }
@@ -393,9 +407,17 @@ fn rejected_notifications_never_write_stdout() {
         &mut child,
         json!({"type":"turn.start","session":{"id":"s1"}}),
     );
+    // SDK 0.7 requires a valid harness identity on every event.
+    let mut missing_harness = event("turn.start", "s1");
+    missing_harness.as_object_mut().unwrap().remove("harness");
+    send(&mut child, missing_harness);
+    let mut invalid_harness = event("turn.start", "s1");
+    invalid_harness["harness"] = json!({"name":"test-host"});
+    send(&mut child, invalid_harness);
     send(&mut child, event("turn.start", "s1"));
     f.wait_calls(1);
     let out = close(child);
     assert!(out.status.success());
     assert!(out.stdout.is_empty());
+    assert_eq!(f.calls().len(), 1);
 }

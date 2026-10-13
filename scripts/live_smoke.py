@@ -100,7 +100,7 @@ def main():
             nonlocal count
             event = {"type": kind, "session": {"id": session}, "turn": {"id": "live-turn-1"}}
             if kind == "session.start":
-                event.update(harness={"name": "sdk-demo-host", "version": "0.1.0"}, items=[], permissionMode="default", trigger="startup")
+                event.update(items=[], permissionMode="default", trigger="startup")
             elif kind == "turn.start":
                 event.update(items=[], trigger="user")
             elif kind == "turn.end":

@@ -2,7 +2,7 @@
 //! registered hook through the SDK.
 use agenthooksprotocol::{
     capability::{self, HostCapabilities},
-    hooks::{Hooks, HooksOptions},
+    hooks::{Harness, Hooks, HooksOptions},
     registration::Registration,
 };
 use std::io::{BufRead, Write};
@@ -17,6 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Grant only the events the host actually emits.
     let options = HooksOptions::new(
         "urn:example:agent",
+        Harness::new("sdk-demo-host", env!("CARGO_PKG_VERSION")),
         HostCapabilities {
             session_start: Some(capability::session_start().observe()),
             turn_start: Some(capability::turn_start().observe()),
