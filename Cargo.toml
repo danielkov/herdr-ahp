@@ -6,6 +6,7 @@ rust-version = "1.88"
 description = "Agent Hooks Protocol hook that reports agent state to HerdR"
 license = "Apache-2.0"
 repository = "https://github.com/danielkov/herdr-ahp"
+homepage = "https://github.com/danielkov/herdr-ahp"
 readme = "README.md"
 keywords = ["herdr", "ahp", "agent-hooks", "agents", "terminal"]
 categories = ["command-line-utilities", "development-tools"]
@@ -18,6 +19,11 @@ serde_json = { version = "=1.0.151", default-features = false, features = ["std"
 [profile.dev]
 debug = 0
 incremental = false
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
 
 [dev-dependencies]
 agenthooksprotocol = { version = "=0.6.0", default-features = false, features = ["tokio-process"] }
