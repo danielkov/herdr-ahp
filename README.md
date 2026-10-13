@@ -69,9 +69,9 @@ A harness built on the Rust SDK grants observe on every subscribed event:
 ```rust
 use agenthooksprotocol::{
     capability::{self, HostCapabilities},
-    hooks::{Hooks, HooksOptions},
+    hooks::{Harness, Hooks, HooksOptions},
 };
-let options = HooksOptions::new("urn:example:agent", HostCapabilities {
+let options = HooksOptions::new("urn:example:agent", Harness::new("example-host", "0.1.0"), HostCapabilities {
     session_start: Some(capability::session_start().observe()),
     turn_start: Some(capability::turn_start().observe()),
     turn_end: Some(capability::turn_end().observe()),
@@ -140,7 +140,7 @@ The tests in `tests/stdio.rs` (Unix only) use a shell script in place of the Her
 Manual smoke test outside HerdR (expect no output, exit 0):
 
 ```sh
-printf '%s\n' '{"jsonrpc":"2.0","method":"hooks/observe","params":{"protocolVersion":"draft","event":{"id":"evt-smoke","source":"urn:example:agent","type":"turn.start","time":"2026-10-07T12:00:00Z","session":{"id":"session-smoke"},"turn":{"id":"turn-smoke"},"trigger":"user","items":[]}}}' \
+printf '%s\n' '{"jsonrpc":"2.0","method":"hooks/observe","params":{"protocolVersion":"draft","event":{"id":"evt-smoke","source":"urn:example:agent","harness":{"name":"example-host","version":"0.1.0"},"type":"turn.start","time":"2026-10-07T12:00:00Z","session":{"id":"session-smoke"},"turn":{"id":"turn-smoke"},"trigger":"user","items":[]}}}' \
   | HERDR_ENV=0 target/release/herdr-ahp
 ```
 
