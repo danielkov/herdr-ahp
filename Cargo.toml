@@ -3,7 +3,13 @@ name = "herdr-ahp"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Generic Agent Hooks Protocol observation bridge for HerdR"
+description = "Agent Hooks Protocol hook that reports agent state to HerdR"
+license = "Apache-2.0"
+repository = "https://github.com/danielkov/herdr-ahp"
+readme = "README.md"
+keywords = ["herdr", "ahp", "agent-hooks", "agents", "terminal"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["scripts/", ".github/"]
 
 [dependencies]
 agenthooksprotocol = { version = "=0.6.0", default-features = false }
