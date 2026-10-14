@@ -11,7 +11,7 @@ use std::{
 pub struct Config {
     /// Stable integration source, distinct from the AHP event source.
     pub source: String,
-    /// User-visible agent name. Falls back to the event's `session.agent.id`.
+    /// User-visible agent name. Falls back to `harness.name`, then legacy `session.agent.id`.
     pub agent: Option<String>,
     /// Command that reopens a session; `{session_id}` is substituted.
     pub resume_argv: Vec<String>,
@@ -54,6 +54,7 @@ impl Config {
     fn agent_for(&self, event: &Value) -> String {
         self.agent
             .as_deref()
+            .or(event["harness"]["name"].as_str().filter(|a| valid_name(a)))
             .or(event["session"]["agent"]["id"]
                 .as_str()
                 .filter(|a| valid_name(a)))
@@ -392,7 +393,7 @@ mod tests {
         );
     }
     #[test]
-    fn agent_name_falls_back_to_event_then_default() {
+    fn agent_name_prefers_harness_then_legacy_agent_then_default() {
         let event =
             serde_json::json!({"type":"turn.start","session":{"id":"s1","agent":{"id":"codex"}}});
         assert_eq!(map_event(&config(), &event).unwrap().agent, "example-agent");
@@ -400,6 +401,36 @@ mod tests {
         assert_eq!(map_event(&config, &event).unwrap().agent, "codex");
         let bare = serde_json::json!({"type":"turn.start","session":{"id":"s1"}});
         assert_eq!(map_event(&config, &bare).unwrap().agent, DEFAULT_AGENT);
+        let mut harness = bare.clone();
+        harness["harness"] = serde_json::json!({"name":"kit","version":"0.2.11"});
+        assert_eq!(map_event(&config, &harness).unwrap().agent, "kit");
+        assert_eq!(
+            map_event(&self::config(), &harness).unwrap().agent,
+            "example-agent"
+        );
+        harness["session"]["agent"] = serde_json::json!({"id":"codex"});
+        assert_eq!(map_event(&config, &harness).unwrap().agent, "kit");
+        for invalid in [
+            serde_json::json!(""),
+            serde_json::json!("bad\nname"),
+            serde_json::json!(42),
+        ] {
+            harness["session"]["agent"]["id"] = invalid;
+            assert_eq!(map_event(&config, &harness).unwrap().agent, "kit");
+        }
+        harness["session"]["agent"] = serde_json::Value::Null;
+        for invalid in [
+            serde_json::json!(""),
+            serde_json::json!("bad\nname"),
+            serde_json::json!(42),
+            serde_json::json!("x".repeat(129)),
+        ] {
+            harness["harness"]["name"] = invalid;
+            assert_eq!(map_event(&config, &harness).unwrap().agent, DEFAULT_AGENT);
+            harness["session"]["agent"] = serde_json::json!({"id":"codex"});
+            assert_eq!(map_event(&config, &harness).unwrap().agent, "codex");
+            harness["session"]["agent"] = serde_json::Value::Null;
+        }
     }
     #[test]
     fn resume_constraints_do_not_suppress_state() {

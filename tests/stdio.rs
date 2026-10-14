@@ -126,6 +126,27 @@ fn seq(args: &[String]) -> u64 {
     args[i + 1].parse().unwrap()
 }
 #[test]
+fn reports_harness_name_without_agent_override() {
+    let mut f = Fixture::new("harness-name", false, "");
+    f.args.drain(2..4); // Remove --agent and its value.
+    let mut child = f.spawn(true);
+    let mut e = event("turn.start", "s1");
+    e["harness"]["name"] = json!("kit");
+    send(&mut child, e);
+    f.wait_calls(1);
+    let output = close(child);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = f.calls();
+    let args = &calls[0];
+    let p = args.iter().position(|s| s == "--agent").unwrap();
+    assert_eq!(args[p + 1], "kit");
+}
+
+#[test]
 fn maps_states_resume_and_actual_exit_opt_in() {
     let f = Fixture::new("mapping", true, "");
     let mut child = f.spawn(true);

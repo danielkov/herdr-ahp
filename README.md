@@ -55,7 +55,7 @@ Pass these in the transport's `args`. All are optional.
 
 | Flag | Meaning |
 | --- | --- |
-| `--agent NAME` | Name shown in HerdR. Defaults to the event's `session.agent.id`, then `agent`. |
+| `--agent NAME` | Name shown in HerdR. Defaults to the event's `harness.name`, then legacy `session.agent.id`, then `agent`. |
 | `--source ID` | HerdR integration source. Default `herdr-ahp`. Must not start with `herdr:`. |
 | `--event-source URN` | Ignore events whose AHP `source` differs. |
 | `--session-id ID` | Ignore events from other sessions. |
