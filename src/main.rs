@@ -1,4 +1,4 @@
-use agenthooksprotocol::{adapters::stdio, server::*};
+use agenthooksprotocol::{Configuration, adapters::stdio, content, event, server::*, subscription};
 use herdr_ahp::{Config, Reporter};
 use std::{
     future::Future,
@@ -38,7 +38,7 @@ impl Authenticator for LocalProcess {
 type Observer<E> = Arc<dyn Fn(ObserveContext<E>, E) -> ServerFuture<()> + Send + Sync>;
 /// Mapping is keyed on the canonical event JSON, so every mapped event shares one
 /// callback. Unmapped observations are accepted by the SDK without a handler;
-/// discovery/interception have no handler and are rejected.
+/// interception has no handler and is rejected.
 fn forward<E: 'static>(reporter: &Arc<Reporter>) -> Option<Observer<E>> {
     let reporter = reporter.clone();
     Some(Arc::new(move |ctx, _| {
@@ -91,6 +91,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     observe.tool_permission_resolved = forward(&reporter);
     observe.user_elicitation_request = forward(&reporter);
     observe.user_elicitation_result = forward(&reporter);
+    // Advertise only mapped observations, without prompt/tool content or uploads.
+    handlers.configuration = Some(
+        Configuration::new()
+            .subscribe(
+                subscription::observe(event::SessionStart).content(content::Selection::metadata()),
+            )
+            .subscribe(
+                subscription::observe(event::TurnStart).content(content::Selection::metadata()),
+            )
+            .subscribe(
+                subscription::observe(event::TurnEnd).content(content::Selection::metadata()),
+            )
+            .subscribe(
+                subscription::observe(event::ToolPermissionRequest)
+                    .content(content::Selection::metadata()),
+            )
+            .subscribe(
+                subscription::observe(event::ToolPermissionResolved)
+                    .content(content::Selection::metadata()),
+            )
+            .subscribe(
+                subscription::observe(event::UserElicitationRequest)
+                    .content(content::Selection::metadata()),
+            )
+            .subscribe(
+                subscription::observe(event::UserElicitationResult)
+                    .content(content::Selection::metadata()),
+            ),
+    );
     let server = Server {
         handlers,
         authenticator: LocalProcess,

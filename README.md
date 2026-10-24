@@ -49,6 +49,19 @@ Add the hook to your harness's AHP config (`examples/registration.json`):
 `examples/registration-with-interactions.json` also subscribes to permission and
 elicitation events, for harnesses that emit them.
 
+### Subscription discovery
+
+Hosts that support `hooks/configuration` (Rust SDK 0.10+) can omit
+`subscriptions`, as in `examples/registration-discovery.json`. The hook advertises
+all seven events in the mapping below as observe-only, metadata-only subscriptions,
+with no uploads. The host retains only events it grants; discovery does not expand
+host capabilities. Explicit subscriptions still override these defaults, so the
+existing registration examples work unchanged. An empty subscription array is
+invalid, not a request for discovery.
+
+The Rust SDK initializes discovery on the first awaited event. Call
+`hooks.initialize().await?` before inspecting subscription or interception lookups.
+
 ### Options
 
 Pass these in the transport's `args`. All are optional.
@@ -115,7 +128,7 @@ nothing.
   timed-out call clears that, so the next state is always sent.
 - `--seq` is the wall-clock time in microseconds, bumped past the previous value
   if the clock stalls.
-- Diagnostics go to stderr. The hook never writes to stdout for observations.
+- Diagnostics go to stderr. The hook never writes to stdout for observations; configuration requests receive JSON-RPC responses.
 
 ## Exit
 

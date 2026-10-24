@@ -1,0 +1,7 @@
+{
+  "protocolVersion": "draft",
+  "hooks": [{
+    "id": "com.github.danielkov.herdr-ahp",
+    "transport": { "type": "stdio", "command": "herdr-ahp", "lifecycle": "persistent" }
+  }]
+}
