@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "development-tools"]
 exclude = ["scripts/", ".github/"]
 
 [dependencies]
-agenthooksprotocol = { version = "=0.7.0", default-features = false }
+agenthooksprotocol = { version = "=0.10.1", default-features = false }
 serde_json = { version = "=1.0.151", default-features = false, features = ["std"] }
 
 [profile.dev]
@@ -26,5 +26,5 @@ inherits = "release"
 lto = "thin"
 
 [dev-dependencies]
-agenthooksprotocol = { version = "=0.7.0", default-features = false, features = ["tokio-process"] }
+agenthooksprotocol = { version = "=0.10.1", default-features = false, features = ["tokio-process"] }
 tokio = { version = "=1.53.1", default-features = false, features = ["rt", "time"] }

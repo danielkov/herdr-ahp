@@ -250,6 +250,15 @@ fn invalid_framing_does_not_release_and_uncertain_report_does() {
 }
 #[test]
 fn sdk_registered_process_observe_smoke() {
+    sdk_process_observe_smoke(false);
+}
+
+#[test]
+fn sdk_discovered_process_observe_smoke() {
+    sdk_process_observe_smoke(true);
+}
+
+fn sdk_process_observe_smoke(discover: bool) {
     use agenthooksprotocol::{
         capability::{self, HostCapabilities},
         generated as g,
@@ -257,13 +266,20 @@ fn sdk_registered_process_observe_smoke() {
         inputs::*,
         registration::Registration,
     };
-    let f = Fixture::new("sdk", false, "");
+    let f = Fixture::new(if discover { "sdk-discovered" } else { "sdk" }, false, "");
     // Registration has no env map, so set HerdR variables through sh.
-    let registration: Registration = serde_json::from_value(json!({"protocolVersion":"draft","hooks":[{
+    let mut registration = json!({"protocolVersion":"draft","hooks":[{
         "id":"org.example.bridge","transport":{"type":"stdio","command":"/bin/sh",
         "args":["-c","export HERDR_ENV=1 HERDR_BIN_PATH=/bin/sh HERDR_PANE_ID=pane-test HERDR_SOCKET_PATH=unused; exec \"$0\" --agent example-agent", env!("CARGO_BIN_EXE_herdr-ahp")],
         "cwd":f.root,"lifecycle":"persistent"},
-        "subscriptions":[{"events":["turn.start"],"mode":"observe","content":{"default":"metadata"}}]}]})).unwrap();
+        "subscriptions":[{"events":["turn.start"],"mode":"observe","content":{"default":"metadata"}}]}]});
+    if discover {
+        registration["hooks"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("subscriptions");
+    }
+    let registration: Registration = serde_json::from_value(registration).unwrap();
     let options = HooksOptions::new(
         "urn:example:host",
         g::Harness::new("test-host", "0.1.0"),
@@ -441,4 +457,38 @@ fn rejected_notifications_never_write_stdout() {
     assert!(out.status.success());
     assert!(out.stdout.is_empty());
     assert_eq!(f.calls().len(), 1);
+}
+
+#[test]
+fn configuration_advertises_only_metadata_observations() {
+    let f = Fixture::new("configuration", false, "");
+    let mut child = f.spawn(true);
+    let request = json!({"jsonrpc":"2.0","id":1,"method":"hooks/configuration",
+        "params":{"protocolVersion":"draft"}});
+    writeln!(child.stdin.as_mut().unwrap(), "{request}").unwrap();
+    let out = close(child);
+    assert!(out.status.success());
+    let response: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(response["id"], 1);
+    assert_eq!(response["result"]["protocolVersion"], "draft");
+    let subscriptions = response["result"]["configuration"]["subscriptions"]
+        .as_array()
+        .unwrap();
+    let expected = [
+        "session.start",
+        "turn.start",
+        "turn.end",
+        "tool.permission.request",
+        "tool.permission.resolved",
+        "user.elicitation.request",
+        "user.elicitation.result",
+    ];
+    assert_eq!(subscriptions.len(), expected.len());
+    for (subscription, event) in subscriptions.iter().zip(expected) {
+        assert_eq!(subscription["events"], json!([event]));
+        assert_eq!(subscription["mode"], "observe");
+        assert_eq!(subscription["content"], json!({"default":"metadata"}));
+        assert!(subscription.get("upload").is_none());
+    }
+    assert!(f.calls().is_empty());
 }
